@@ -6,25 +6,13 @@ import numpy as np
 """Script de utilidades para el proyecto."""
 
 def get_db_engine():
-    """Crea engine de SQLAlchemy para PostgreSQL
-    reutilizable para training.py y scoring.py.
+    """Crea el engine de SQLAlchemy para PostgreSQL.
+
+    La configuracion se lee de src/config.py, que centraliza las variables de
+    entorno, en vez de releer os.environ en cada modulo.
     """
-    
-    db_config = {
-        'host': os.getenv('DB_HOST', 'localhost'),
-        'port': os.getenv('DB_PORT', '5432'),
-        'user': os.getenv('DB_USER', 'metlife_user'),
-        'password': os.getenv('DB_PASSWORD', 'metlife_pass'),
-        'database': os.getenv('DB_NAME', 'metlife_db')
-    }
-    
-    connection_string = (
-        f"postgresql://{db_config['user']}:{db_config['password']}"
-        f"@{db_config['host']}:{db_config['port']}/{db_config['database']}"
-    )
-    
-    engine = create_engine(connection_string)
-    return engine
+    import config
+    return create_engine(config.get_db_url())
 
 def feature_engineering(X, is_training=True):
     """Feature engineering aplicable a training y a scoring

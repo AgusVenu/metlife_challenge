@@ -206,8 +206,36 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# ============================================================================
+# Artefactos generados por el pipeline (no se versionan)
+# ============================================================================
 *.pkl
 *.json
 *.txt
+
+models/
+results/
+logs/
+
+# MLflow: backend SQLite + artifact store
+mlruns/
+mlflow/
+mlartifacts/
+*.db
+
+# ============================================================================
+# Excepciones: archivos que SI deben versionarse
+# ----------------------------------------------------------------------------
+# Las reglas *.txt / *.json de arriba son demasiado amplias y llegaban a
+# ignorar requirements.txt, lo que rompia `COPY requirements.txt .` en el
+# Dockerfile. Estas negaciones lo corrigen.
+# ============================================================================
+!requirements.txt
+!README.md
+!challenge_ml.md
+!DECISIONS.md
+!SOLUTION.md
+!data/README.md
+!.env.template
 
 *.DS_Store

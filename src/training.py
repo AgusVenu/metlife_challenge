@@ -1,456 +1,643 @@
-import pandas as pd
-import numpy as np
-from sqlalchemy import text
-from sklearn.model_selection import train_test_split, RandomizedSearchCV
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import root_mean_squared_error,mean_absolute_error, r2_score
-import xgboost as xgb
-import joblib
+"""Pipeline de entrenamiento con tracking de experimentos en MLflow.
+
+Que se registra por cada ejecucion
+----------------------------------
+    Parametros : hiperparametros ganadores, semillas, folds, iteraciones,
+                 features usadas, transformacion del target
+    Metricas   : RMSE / MAE / R2 / R2 ajustado / MAPE en train y validacion,
+                 en escala de dolares y en escala log, mas el score de CV y
+                 el gap de overfitting
+    Artefactos : modelo serializado con signature, reporte de metricas,
+                 metadata, baseline_stats.json, cv_results.csv e importancia
+                 de features (JSON + grafico)
+
+Criterio de mejor modelo
+------------------------
+Se optimiza `MODEL_SELECTION_METRIC` (por defecto val_rmse, minimizando). Cada
+corrida registra una version nueva en el Model Registry con alias `staging`; la
+promocion a `production` es una decision aparte que toma src/promote_model.py
+comparando contra el modelo que hoy esta sirviendo.
+"""
+
+import json
 import logging
 import os
-import sys
-import json
-from datetime import datetime
-from utils import get_db_engine, feature_engineering, transform_target
 import shutil
-# Setup de logging
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")           # backend sin display: el pipeline corre headless
+import matplotlib.pyplot as plt
+import mlflow
+import numpy as np
+import pandas as pd
+import joblib
+import xgboost as xgb
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import mean_absolute_error, r2_score, root_mean_squared_error
+from sklearn.model_selection import RandomizedSearchCV, train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+
+import config
+import mlflow_utils
+import monitoring
+from utils import feature_engineering, get_db_engine, transform_target
+
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
+# Datos
+# ============================================================================
+
 def load_training_data(engine):
-    """Cargo los datos de entrenamiento desde la db"""
-    
+    """Carga los datos de entrenamiento desde la base."""
     logger.info("Cargando datos de entrenamiento desde la base de datos...")
-    
-    query = "SELECT * FROM training_dataset";
-    df = pd.read_sql(query, engine)
-    logger.info(f"Datos cargados: {df.shape[0]} filas, {df.shape[1]} columnas.")
-    logger.info(f"Columnas: {df.columns.tolist()}")
-    
+    df = pd.read_sql("SELECT * FROM training_dataset", engine)
+    logger.info("Datos cargados: %d filas, %d columnas.", df.shape[0], df.shape[1])
+    logger.info("Columnas: %s", df.columns.tolist())
     return df
 
+
 def prepare_features_target(df):
-    """Separar features y target con transformaciones y agregado de variables para mejorar predicciones"""
+    """Separa features y target, aplicando feature engineering y log1p."""
+    df = df.drop([c for c in ("id", "created_at") if c in df.columns], axis=1)
 
-    # Eliminar columnas no necesarias
-    columns_to_drop = ['id', 'created_at']
-    df = df.drop([col for col in columns_to_drop if col in df.columns], axis=1)
+    X = df.drop(config.TARGET_COLUMN, axis=1)
+    y = df[config.TARGET_COLUMN]
 
-    # Separar X e y
-    X = df.drop('charges', axis=1)
-    y = df['charges']
+    logger.info("Features (X): %s", X.columns.tolist())
+    logger.info("Target original (y): %s", config.TARGET_COLUMN)
+    logger.info("  - Min: $%s", f"{y.min():,.2f}")
+    logger.info("  - Max: $%s", f"{y.max():,.2f}")
+    logger.info("  - Mean: $%s", f"{y.mean():,.2f}")
+    logger.info("  - Median: $%s", f"{y.median():,.2f}")
+    logger.info("  - Skewness: %.3f", y.skew())
 
-    logger.info(f"Features (X): {X.columns.tolist()}")
-    logger.info(f"Target original(y): charges")
-    logger.info(f"  - Min: ${y.min():,.2f}")
-    logger.info(f"  - Max: ${y.max():,.2f}")
-    logger.info(f"  - Mean: ${y.mean():,.2f}")
-    logger.info(f"  - Median: ${y.median():,.2f}")
-    logger.info(f"  - Skewness: {y.skew():.3f}")
-
-    # Aplicar feature engineering
     X = feature_engineering(X, is_training=True)
-
-    # Aplicar transform de target
-    y_original=y.copy()
+    y_original = y.copy()
     y_transformed = transform_target(y, inverse=False)
+    logger.info("Skewness tras log1p: %.3f", pd.Series(y_transformed).skew())
 
     return X, y_transformed, y_original
 
-def split_data(X, y_transformed, y_original, test_size=0.2, random_state=43):
-    """Split train/validation"""
+
+def split_data(X, y_transformed, y_original, test_size=None, random_state=None):
+    """Split train/validation manteniendo alineadas las dos escalas del target."""
+    test_size = config.TEST_SIZE if test_size is None else test_size
+    random_state = config.SPLIT_SEED if random_state is None else random_state
 
     X_train, X_val, y_train_log, y_val_log, y_train_orig, y_val_orig = train_test_split(
-        X, y_transformed, y_original, test_size=test_size, random_state=random_state, shuffle=True
+        X, y_transformed, y_original,
+        test_size=test_size, random_state=random_state, shuffle=True,
     )
 
-    logger.info(f"Train set: {X_train.shape[0]} samples ({(1-test_size)*100:.0f}%)")
-    logger.info(f"Validation set: {X_val.shape[0]} samples ({test_size*100:.0f}%)")
-    
-    # Stats del target TRANSFORMADO (log)
-    logger.info(f"\nTarget TRANSFORMADO (log):")
-    logger.info(f"  Train - mean: {y_train_log.mean():.3f}, std: {y_train_log.std():.3f}")
-    logger.info(f"  Val   - mean: {y_val_log.mean():.3f}, std: {y_val_log.std():.3f}")
-    
-    # Stats del target ORIGINAL ($) - para referencia
-    logger.info(f"\nTarget ORIGINAL ($):")
-    logger.info(f"  Train - mean: ${y_train_orig.mean():,.2f}, std: ${y_train_orig.std():,.2f}")
-    logger.info(f"  Val   - mean: ${y_val_orig.mean():,.2f}, std: ${y_val_orig.std():,.2f}")
-    
+    logger.info("Train set: %d muestras (%.0f%%)", X_train.shape[0], (1 - test_size) * 100)
+    logger.info("Validation set: %d muestras (%.0f%%)", X_val.shape[0], test_size * 100)
+    logger.info("Target log  - train mean=%.3f std=%.3f | val mean=%.3f std=%.3f",
+                y_train_log.mean(), y_train_log.std(), y_val_log.mean(), y_val_log.std())
+    logger.info("Target $    - train mean=$%s | val mean=$%s",
+                f"{y_train_orig.mean():,.2f}", f"{y_val_orig.mean():,.2f}")
+
     return X_train, X_val, y_train_log, y_val_log, y_train_orig, y_val_orig
 
+
+# ============================================================================
+# Modelo
+# ============================================================================
+
 def create_preprocessor():
-    """Pipeline de preprocesamiento de features"""
-    categorical_features = ['sex', 'smoker', 'region']
-    numerical_features = ['age', 'bmi', 'children',
-                        'bmi_smoker', 'age_smoker',
-                        'bmi_squared', 'age_squared',
-                        'bmi_obese', 'age_senior'
-                        ]
-    
-    preprocessor= ColumnTransformer(
+    """ColumnTransformer: numericas passthrough + one-hot para las categoricas."""
+    preprocessor = ColumnTransformer(
         transformers=[
-            ('num', 'passthrough', numerical_features),
-            ('cat', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'), categorical_features)
+            ("num", "passthrough", config.NUMERICAL_FEATURES),
+            ("cat", OneHotEncoder(drop="first", sparse_output=False, handle_unknown="ignore"),
+             config.CATEGORICAL_FEATURES),
         ],
-        remainder='drop'
+        remainder="drop",
     )
-    
     logger.info("Preprocesador configurado")
-    logging.info(f"  - Features numéricas: {numerical_features}")
-    logging.info(f"  - Features categóricas: {categorical_features}")
-    
+    logger.info("  - Features numericas: %s", config.NUMERICAL_FEATURES)
+    logger.info("  - Features categoricas: %s", config.CATEGORICAL_FEATURES)
     return preprocessor
 
+
 def define_hyperparameter_grid():
-    """Grid de hiperparámetros para XGBoost"""
-
+    """Grid de busqueda para XGBoost."""
     param_distributions = {
-        'model__n_estimators': [100, 200, 300, 500],
-        'model__max_depth': [3, 5, 7, 9],
-        'model__learning_rate': [0.01, 0.05, 0.1, 0.2],
-        # Estos los agrego despues para no tener un tiempo de entrenamiento tan largo
-        # y en funcion de los resultados que vaya obteniendo con el grid inicial
-        # 'model__subsample': [0.7, 0.8, 0.9, 1.0],
-        # 'model__colsample_bytree': [0.7, 0.8, 0.9, 1.0],
-        # 'model__min_child_weight': [1, 3, 5],
-        # 'model__gamma': [0, 0.1, 0.2],
-        'model__reg_alpha': [0, 0.1, 1],  # L1 regularization
-        'model__reg_lambda': [1, 10, 100],  # L2 regularization
+        "model__n_estimators": [100, 200, 300, 500],
+        "model__max_depth": [3, 5, 7, 9],
+        "model__learning_rate": [0.01, 0.05, 0.1, 0.2],
+        "model__reg_alpha": [0, 0.1, 1],        # L1
+        "model__reg_lambda": [1, 10, 100],      # L2
     }
-
-    total_combinations = np.prod([len(v) for v in param_distributions.values()])
-    logger.info(f"Hyperparameter grid definido:")
-    logger.info(f"  - Total combinaciones posibles: {total_combinations:,}")
-    logger.info(f"  - Parámetros: {list(param_distributions.keys())}")
-
+    total = int(np.prod([len(v) for v in param_distributions.values()]))
+    logger.info("Hyperparameter grid: %d combinaciones posibles", total)
     return param_distributions
 
+
 def train_model(X_train, y_train):
-    """Entrenamiento del modelo con RandomizedSearchCV"""
+    """Entrena con RandomizedSearchCV sobre el pipeline completo."""
+    logger.info("Iniciando entrenamiento con RandomizedSearchCV...")
 
-    logger.info("Iniciando entrenamiento del modelo con RandomizedSearchCV...")
-    
-    preprocessor= create_preprocessor()
-    model=xgb.XGBRegressor(
-        objective='reg:squarederror',
-        random_state=42,
-        n_jobs=-1,
-        verbosity=0
-        )
-    
     pipeline = Pipeline([
-        ('preprocessor', preprocessor),
-        ('model', model)
+        ("preprocessor", create_preprocessor()),
+        ("model", xgb.XGBRegressor(
+            objective="reg:squarederror",
+            random_state=config.RANDOM_SEED,
+            n_jobs=-1,
+            verbosity=0,
+        )),
     ])
-    
-    param_grid= define_hyperparameter_grid()
-    n_iter=int(os.getenv('HIPERPARAM_ITERATIONS', 350))
-    cv_folds=int(os.getenv('CV_FOLDS', 5))
-    
-    logger.info(f"Configuracion de busqueda:")
-    logger.info(f"  - Metodo: RandomizedSearchCV")
-    logger.info(f"  - Iteraciones: {n_iter}")
-    logger.info(f"  - Cross-validation folds: {cv_folds}")
-    logger.info(f"  - Scoring metric: neg_root_mean_squared_error")
 
-    random_search = RandomizedSearchCV(
+    # Bug corregido: el codigo original leia HIPERPARAM_ITERATIONS (con typo) y
+    # docker-compose exporta HYPERPARAM_ITERATIONS, asi que la variable nunca
+    # tenia efecto y se entrenaba siempre con el default de 350 iteraciones.
+    n_iter, cv_folds = config.HYPERPARAM_ITERATIONS, config.CV_FOLDS
+
+    logger.info("Configuracion de busqueda:")
+    logger.info("  - Metodo: RandomizedSearchCV")
+    logger.info("  - Iteraciones: %d", n_iter)
+    logger.info("  - Cross-validation folds: %d", cv_folds)
+    logger.info("  - Scoring: neg_root_mean_squared_error (sobre el target en log)")
+
+    search = RandomizedSearchCV(
         pipeline,
-        param_distributions=param_grid,
+        param_distributions=define_hyperparameter_grid(),
         n_iter=n_iter,
         cv=cv_folds,
-        scoring='neg_root_mean_squared_error',
+        scoring="neg_root_mean_squared_error",
         n_jobs=-1,
-        random_state=42,
-        verbose=2,
+        random_state=config.RANDOM_SEED,
+        verbose=1,
         return_train_score=True,
-        refit=True
+        refit=True,
     )
-    
-    logger.info("Ejecutando RandomizedSearchCV...")
-    logger.info(f"  - Esto puede tardar varios minutos dependiendo del tamaño del grid y la cantidad de iteraciones.")
-    random_search.fit(X_train, y_train)
-    
-    logger.info("RandomizedSearchCV completado.")
-    logger.info(f"Mejores hiperparámetros encontrados:")
-    for param, value in random_search.best_params_.items():
-        logger.info(f"  - {param}: {value}")
-    logger.info(f"Mejor RMSE en validación: {-random_search.best_score_:.2f}")
-    
-    return random_search.best_estimator_,random_search
+    search.fit(X_train, y_train)
+
+    logger.info("RandomizedSearchCV completado. Mejores hiperparametros:")
+    for param, value in search.best_params_.items():
+        logger.info("  - %s: %s", param, value)
+    logger.info("Mejor RMSE (CV, escala log): %.4f", -search.best_score_)
+
+    return search.best_estimator_, search
+
+
+def get_output_feature_names(model):
+    """Nombres de las features DESPUES del ColumnTransformer (post one-hot)."""
+    try:
+        return list(model.named_steps["preprocessor"].get_feature_names_out())
+    except Exception:
+        return []
+
+
+# ============================================================================
+# Evaluacion
+# ============================================================================
 
 def evaluate_model(model, X_train, y_train, X_val, y_val, y_train_original, y_val_original):
-    """Evaluar modelo con el set de validacion con y cin transformacion del target
-    
-    Args:
-        model: Modelo entrenado
-        X_train, y_train: Datos de entrenamiento (y_train en escala LOG)
-        X_val, y_val: Datos de validación (y_val en escala LOG)
-        y_train_original, y_val_original: Target en escala ORIGINAL ($$)
-    """
-    logger.info("EVALUACIÓN DEL MODELO")
-    
-    #predicciones con escala log
+    """Evalua en train y validacion, en escala log y en dolares."""
+    logger.info("EVALUACION DEL MODELO")
+
     y_train_pred_log = model.predict(X_train)
     y_val_pred_log = model.predict(X_val)
-    
-    #predicciones con escala original
     y_train_pred = transform_target(y_train_pred_log, inverse=True)
     y_val_pred = transform_target(y_val_pred_log, inverse=True)
-    
-    #Calculo metricas en las dos escalas
-    def calculate_metrics(y_true_log, y_pred_log, y_true_original, y_pred_original, dataset_name):
-        
-        #Metricas log para verificar ajuste
+
+    # Bug corregido: el R2 ajustado usaba la cantidad de columnas ANTES del
+    # preprocesador, ignorando las dummies del one-hot. Se usa el ancho real
+    # de la matriz que ve el modelo.
+    n_features = len(get_output_feature_names(model)) or X_train.shape[1]
+
+    def calculate_metrics(y_true_log, y_pred_log, y_true_original, y_pred_original, name):
         rmse_log = root_mean_squared_error(y_true_log, y_pred_log)
         mae_log = mean_absolute_error(y_true_log, y_pred_log)
         r2_log = r2_score(y_true_log, y_pred_log)
-        mape_log= np.mean(np.abs((y_true_original - y_pred_original) / y_true_original)) * 100
-        
-        #Metricas originales, las que me importan
-        rmse = root_mean_squared_error(y_true_original, y_pred_original)
-        mae = mean_absolute_error(y_true_original, y_pred_original)
-        r2 = r2_score(y_true_original, y_pred_original)
-        mape = np.mean(np.abs((y_true_original - y_pred_original) / y_true_original)) * 100
-        
-        
-        # Adjusted R² (penaliza complejidad del modelo)
+        # Bug corregido: el MAPE "log" del codigo original se calculaba con los
+        # valores en escala original, o sea que duplicaba el MAPE en dolares.
+        mape_log = float(np.mean(np.abs(
+            (np.asarray(y_true_log) - np.asarray(y_pred_log)) / np.asarray(y_true_log)
+        )) * 100)
+
+        base = monitoring.regression_metrics(y_true_original, y_pred_original)
         n = len(y_true_original)
-        p = X_train.shape[1]
-        adj_r2 = 1 - (1 - r2) * (n - 1) / (n - p - 1)
+        adj_r2 = 1 - (1 - base["r2"]) * (n - 1) / max(n - n_features - 1, 1)
 
         metrics = {
-            'rmse_log': rmse_log,
-            'mae_log': mae_log,
-            'r2_log': r2_log,
-            'rmse': rmse,
-            'mae': mae,
-            'r2': r2,
-            'adj_r2': adj_r2,
-            'mape': mape
+            "rmse_log": float(rmse_log), "mae_log": float(mae_log),
+            "r2_log": float(r2_log), "mape_log": mape_log,
+            "rmse": base["rmse"], "mae": base["mae"], "r2": base["r2"],
+            "adj_r2": float(adj_r2), "mape": base["mape"],
         }
-        
-        logger.info(f" {dataset_name.upper()} SET:")
-        logger.info(f" Metricas en escala LOG (para diagnóstico de ajuste):")
-        logger.info(f"  RMSE (log):        ${rmse_log:,.2f}")
-        logger.info(f"  MAE (log):         ${mae_log:,.2f}")
-        logger.info(f"  R² (log):          {r2_log:.4f}")
-        logger.info(f"Metricas en escala original($):")
-        logger.info(f"  RMSE:        ${rmse:,.2f}")
-        logger.info(f"  MAE:         ${mae:,.2f}")
-        logger.info(f"  R²:          {r2:.4f}")
-        logger.info(f"  Adjusted R²: {adj_r2:.4f}")
-        logger.info(f"  MAPE:        {mape:.2f}%")
 
+        logger.info("  %s SET:", name.upper())
+        logger.info("    escala LOG  -> RMSE=%.4f  MAE=%.4f  R2=%.4f",
+                    rmse_log, mae_log, r2_log)
+        logger.info("    escala $    -> RMSE=$%s  MAE=$%s  R2=%.4f  adjR2=%.4f  MAPE=%.2f%%",
+                    f"{base['rmse']:,.2f}", f"{base['mae']:,.2f}",
+                    base["r2"], adj_r2, base["mape"])
         return metrics
-    
+
     train_metrics = calculate_metrics(y_train, y_train_pred_log, y_train_original, y_train_pred, "train")
     val_metrics = calculate_metrics(y_val, y_val_pred_log, y_val_original, y_val_pred, "validation")
-    
-    #Analisis de overfitting
-    r2_diff = train_metrics['r2'] - val_metrics['r2']
-    logger.info(f" OVERFITTING ANALYSIS:")
-    logger.info(f"  R² difference (train - val): {r2_diff:.4f}")
 
+    r2_diff = train_metrics["r2"] - val_metrics["r2"]
+    logger.info("ANALISIS DE OVERFITTING: R2(train) - R2(val) = %.4f", r2_diff)
     if r2_diff > 0.15:
-        logger.warning("SEVERE overfitting detected!")
+        logger.warning("  Overfitting SEVERO")
     elif r2_diff > 0.10:
-        logger.warning("Moderate overfitting detected")
+        logger.warning("  Overfitting moderado")
     elif r2_diff > 0.05:
-        logger.info("Minor overfitting (acceptable)")
+        logger.info("  Overfitting menor (aceptable)")
     else:
-        logger.info("No significant overfitting")
+        logger.info("  Sin overfitting significativo")
 
-    return {
-        'train': train_metrics,
-        'validation': val_metrics,
-        'overfitting_score': r2_diff
-    }, y_val_pred
-    
-    
-def save_model(model, metrics, best_params, output_dir='models'):
-    """Guarda modelo y metadata de los mismos"""
-    
-    logger.info("Guardando modelo y metadata...")
-    
-    os.makedirs(output_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    #Guardo modelo
-    model_filename= f"model_{timestamp}.pkl"
-    model_path = os.path.join(output_dir, model_filename)
-    joblib.dump(model, model_path,compress=3)
-    logger.info(f"Modelo guardado en: {model_path}")
-    
-    #Guardo metadata
+    metrics = {"train": train_metrics, "validation": val_metrics, "overfitting_score": float(r2_diff)}
+    return metrics, y_val_pred
+
+
+def compute_feature_importance(model):
+    """Importancia de features con los nombres reales post one-hot."""
+    names = get_output_feature_names(model)
+    try:
+        importances = model.named_steps["model"].feature_importances_
+    except Exception:
+        return {}
+    if not names or len(names) != len(importances):
+        names = [f"f{i}" for i in range(len(importances))]
+    pairs = sorted(zip(names, (float(v) for v in importances)), key=lambda kv: -kv[1])
+    return dict(pairs)
+
+
+def plot_feature_importance(importance: dict, output_path: Path, top_n: int = 15) -> Path:
+    """Grafico de barras horizontales de la importancia de features.
+
+    Una sola serie de magnitudes: un unico tono secuencial, sin leyenda (el
+    titulo ya nombra la serie), ejes recesivos y valores directos en las barras.
+    """
+    items = list(importance.items())[:top_n][::-1]
+    if not items:
+        return None
+    labels, values = zip(*items)
+
+    ink, muted, series = "#0b0b0b", "#52514e", "#2a78d6"
+    fig, ax = plt.subplots(figsize=(9, 0.42 * len(items) + 1.4), dpi=150)
+    fig.patch.set_facecolor("#fcfcfb")
+    ax.set_facecolor("#fcfcfb")
+
+    bars = ax.barh(range(len(items)), values, height=0.62, color=series)
+    for bar in bars:
+        bar.set_linewidth(0)
+
+    ax.set_yticks(range(len(items)))
+    ax.set_yticklabels(labels, fontsize=9, color=ink)
+    ax.set_xlabel("Importancia (gain relativo)", fontsize=9, color=muted)
+    ax.set_title(f"Importancia de features - top {len(items)}",
+                 fontsize=11, color=ink, loc="left", pad=12)
+
+    span = max(values) if values else 1.0
+    for index, value in enumerate(values):
+        ax.text(value + span * 0.012, index, f"{value:.3f}",
+                va="center", fontsize=8, color=muted)
+
+    ax.set_xlim(0, span * 1.15)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_color("#d8d7d2")
+    ax.tick_params(axis="x", colors=muted, labelsize=8, length=0)
+    ax.tick_params(axis="y", length=0)
+    ax.xaxis.grid(True, color="#ebeae6", linewidth=0.8)
+    ax.set_axisbelow(True)
+
+    fig.tight_layout()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return output_path
+
+
+# ============================================================================
+# Persistencia local (compatibilidad con la ejecucion original del proyecto)
+# ============================================================================
+
+def save_model(model, metrics, best_params, timestamp, output_dir=None):
+    """Guarda el modelo y su metadata en models/.
+
+    MLflow ya es la fuente de verdad, pero se mantiene esta salida porque el
+    challenge pide conservar compatibilidad con la ejecucion actual y porque es
+    el ultimo recurso de la cadena de resolucion de scoring.
+    """
+    output_dir = Path(output_dir or config.MODELS_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = output_dir / f"model_{timestamp}.pkl"
+    joblib.dump(model, model_path, compress=3)
+    logger.info("Modelo guardado en: %s", model_path)
+
     metadata = {
-        'timestamp': timestamp,
-        'model_type': 'XGBoostRegressor',
-        'best_params': best_params,
-        'train_metrics': metrics['train'],
-        'validation_metrics': metrics['validation'],
-        'overfitting_score': metrics['overfitting_score']
+        "timestamp": timestamp,
+        "model_type": "XGBRegressor",
+        "target_transform": "log1p",
+        "best_params": best_params,
+        "train_metrics": metrics["train"],
+        "validation_metrics": metrics["validation"],
+        "overfitting_score": metrics["overfitting_score"],
     }
-    metadata_filename = f"model_metadata_{timestamp}.json"
-    metadata_path = os.path.join(output_dir, metadata_filename)
-    
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
-    logger.info(f"Metadata guardada en: {metadata_path}")
-    
-    #Creo un symlink "latest" para siempre tener referencia al modelo más reciente
-    latest_model_path = os.path.join(output_dir, "best_model.pkl")
-    latest_metadata_path = os.path.join(output_dir, "best_model_metadata.json")
-    
-    shutil.copy2(model_path, latest_model_path)
-    shutil.copy2(metadata_path, latest_metadata_path)
-    logger.info(f"Symlink actualizado: {latest_model_path} -> {model_path}")
-    
-    return model_path
+    metadata_path = output_dir / f"model_metadata_{timestamp}.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+    logger.info("Metadata guardada en: %s", metadata_path)
 
-def generate_report(metrics, best_params, search_results, output_dir='results'):
-    """Generar reporte de evaluacion del modelo"""
-    
-    logger.info("Generando reporte de evaluación...")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = os.path.join(output_dir, f"training_report_{timestamp}.txt")
-    
-    with open(report_path, 'w') as f:
-        f.write("METLIFE INSURANCE COST PREDICTION - TRAINING REPORT\n")
-        
-        f.write(f"\nFecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Timestamp: {timestamp}\n\n")
-        
-        f.write("Modelo seleccionado: XGBoostRegressor\n")
-        f.write(f"\nJustificacion\n")
-        f.write(f"XGBoost fue seleccionado por su excelente performance en problemas de\n")
-        f.write(f"regresión tabular, su capacidad para manejar relaciones no lineales y\n")
-        f.write(f"su robustez frente a outliers. Además, su eficiencia computacional\n")
-        f.write(f"permite realizar una búsqueda de hiperparámetros más exhaustiva.\n")
-        
-        f.write("\nMejores hiperparámetros encontrados:\n")
-        f.write("-"*70 + "\n")
-        for param, value in best_params.items():
-            param_clean = param.replace('model__', '')
-            f.write(f"{param_clean:25s}: {value}\n")
-        f.write("-"*70 + "\n")
-        
-        f.write("\nMétricas de evaluación:\n")
-        f.write("-"*70 + "\n")
-        f.write("TRAIN SET:\n")
-        f.write(f"  RMSE:        ${metrics['train']['rmse']:>12,.2f}\n")
-        f.write(f"  MAE:         ${metrics['train']['mae']:>12,.2f}\n")
-        f.write(f"  R²:          {metrics['train']['r2']:>13.4f}\n")
-        f.write(f"  Adjusted R²: {metrics['train']['adj_r2']:>13.4f}\n")
-        f.write(f"  MAPE:        {metrics['train']['mape']:>12.2f}%\n")
-        f.write("\nVALIDATION SET:\n")
-        f.write(f"  RMSE:        ${metrics['validation']['rmse']:>12,.2f}\n")
-        f.write(f"  MAE:         ${metrics['validation']['mae']:>12,.2f}\n")
-        f.write(f"  R²:          {metrics['validation']['r2']:>13.4f}\n")
-        f.write(f"  Adjusted R²: {metrics['validation']['adj_r2']:>13.4f}\n")
-        f.write(f"  MAPE:        {metrics['validation']['mape']:>12.2f}%\n")
-        
-        f.write("Interpretación de resultados:\n")
-        f.write("-"*70 + "\n")
-        r2_pct = metrics['validation']['r2'] * 100
-        f.write(f"El modelo explica aproximadamente {r2_pct:.2f}% de la varianza en los costos\n")
-        f.write(f"de seguros en el set de validación.\n\n")
-        f.write(f"Error promedio absoluto (MAE) de ${metrics['validation']['mae']:,.2f} por prediccion\n")
-        f.write(f"Error porcentual medio (MAPE) de {metrics['validation']['mape']:.2f}% \n\n")
-        
-        overfitting = metrics['overfitting_score']
-        if overfitting > 0.1:
-            f.write(f"Se detecta un posible overfitting (R² train - R² val = {overfitting:.4f}).\n")
-            f.write(f"Considerar técnicas de regularización o más datos para mejorar generalización.\n")
-        else:
-            f.write(f"No se detecta un overfitting significativo (R² train - R² val = {overfitting:.4f}).\n")
-            f.write(f"El modelo parece generalizar bien al set de validación.\n")
-        
-        f.write("\n" + "="*70 + "\n")
-        f.write("Busqueda de hiperparametros\n")
-        f.write("-"*70 + "\n")
-        f.write(f"Metodo: RandomizedSearchCV\n")
-        f.write(f"Iteraciones: {search_results.n_iter}\n")
-        f.write(f"Cross-validation folds: {search_results.cv}\n")
-        f.write(f"Scoring metric: {search_results.scoring}\n")
-        f.write(f"Mejor score (CV RMSE): {-search_results.best_score_:.2f}\n")
-        
-        f.write("Top 5 combinaciones de hiperparámetros:\n")
-        f.write("-"*70 + "\n")
-        results_df = pd.DataFrame(search_results.cv_results_)
-        results_df= results_df.sort_values('rank_test_score')
-        
-        for idx, row in results_df.head(5).iterrows():
-            f.write(f"\nRank {int(row['rank_test_score'])}:\n")
-            f.write(f"  RMSE={-row['mean_test_score']:,.2f}\n")
-            f.write(f"  Params: {row['params']}\n")
+    # Copia "latest" para que scoring pueda resolver un modelo aun sin MLflow.
+    shutil.copy2(model_path, output_dir / "best_model.pkl")
+    shutil.copy2(metadata_path, output_dir / "best_model_metadata.json")
+    logger.info("Copia actualizada: %s", output_dir / "best_model.pkl")
 
-    logger.info(f"Reporte generado en: {report_path}")
+    return model_path, metadata_path
+
+
+def generate_report(metrics, best_params, search_results, timestamp, output_dir=None):
+    """Reporte de evaluacion en texto plano."""
+    output_dir = Path(output_dir or config.RESULTS_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / f"training_report_{timestamp}.txt"
+
+    width = 70
+    lines = [
+        "=" * width,
+        "METLIFE INSURANCE COST PREDICTION - TRAINING REPORT",
+        "=" * width,
+        f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Timestamp: {timestamp}",
+        "",
+        "Modelo seleccionado: XGBRegressor (target transformado con log1p)",
+        "",
+        "Justificacion",
+        "-" * width,
+        "XGBoost fue seleccionado por su performance en regresion tabular, su",
+        "capacidad de capturar interacciones no lineales (en particular",
+        "smoker x bmi) y su robustez frente a outliers. Su eficiencia permite",
+        "una busqueda de hiperparametros amplia en minutos.",
+        "",
+        "Mejores hiperparametros",
+        "-" * width,
+    ]
+    for param, value in best_params.items():
+        lines.append(f"{param.replace('model__', ''):<25}: {value}")
+
+    lines += ["", "Metricas de evaluacion", "-" * width,
+              f"{'':<14}{'TRAIN':>16}{'VALIDATION':>16}"]
+    for key, label, fmt in [("rmse", "RMSE", "${:,.2f}"), ("mae", "MAE", "${:,.2f}"),
+                            ("r2", "R2", "{:.4f}"), ("adj_r2", "Adjusted R2", "{:.4f}"),
+                            ("mape", "MAPE", "{:.2f}%")]:
+        lines.append(f"{label:<14}{fmt.format(metrics['train'][key]):>16}"
+                     f"{fmt.format(metrics['validation'][key]):>16}")
+
+    r2_pct = metrics["validation"]["r2"] * 100
+    overfitting = metrics["overfitting_score"]
+    lines += [
+        "", "Interpretacion", "-" * width,
+        f"El modelo explica aproximadamente {r2_pct:.2f}% de la varianza de los",
+        "costos en el set de validacion.",
+        f"Error absoluto medio (MAE): ${metrics['validation']['mae']:,.2f} por prediccion.",
+        f"Error porcentual medio (MAPE): {metrics['validation']['mape']:.2f}%.",
+        "",
+    ]
+    if overfitting > 0.10:
+        lines += [f"Se detecta posible overfitting (R2 train - R2 val = {overfitting:.4f}).",
+                  "Considerar mas regularizacion o mas datos."]
+    else:
+        lines += [f"No se detecta overfitting significativo (R2 train - R2 val = {overfitting:.4f}).",
+                  "El modelo generaliza bien al set de validacion."]
+
+    lines += ["", "=" * width, "Busqueda de hiperparametros", "-" * width,
+              "Metodo: RandomizedSearchCV",
+              f"Iteraciones: {search_results.n_iter}",
+              f"Cross-validation folds: {search_results.cv}",
+              f"Scoring: {search_results.scoring}",
+              f"Mejor score (CV RMSE en escala log): {-search_results.best_score_:.4f}",
+              "", "Top 5 combinaciones:", "-" * width]
+
+    results_df = pd.DataFrame(search_results.cv_results_).sort_values("rank_test_score")
+    for _, row in results_df.head(5).iterrows():
+        lines += [f"  Rank {int(row['rank_test_score'])}: RMSE(log)={-row['mean_test_score']:.4f}",
+                  f"    {row['params']}"]
+
+    lines += ["", "=" * width]
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("Reporte generado en: %s", report_path)
     return report_path
 
+
+# ============================================================================
+# MLflow
+# ============================================================================
+
+def log_search_trials(search_results, top_n: int = 10):
+    """Registra las mejores combinaciones de la busqueda como runs anidados.
+
+    Deja trazada la busqueda entera y no solo al ganador, que es lo que permite
+    responder despues "por que este modelo y no otro".
+    """
+    results_df = pd.DataFrame(search_results.cv_results_).sort_values("rank_test_score")
+    for _, row in results_df.head(top_n).iterrows():
+        with mlflow.start_run(nested=True, run_name=f"trial_rank_{int(row['rank_test_score'])}"):
+            mlflow.log_params({k.replace("model__", ""): v for k, v in row["params"].items()})
+            mlflow.log_metrics({
+                "cv_rmse_log": float(-row["mean_test_score"]),
+                "cv_rmse_log_std": float(row["std_test_score"]),
+                "cv_train_rmse_log": float(-row["mean_train_score"]),
+                "rank": int(row["rank_test_score"]),
+            })
+            mlflow.set_tag("trial", "hyperparameter_search")
+
+
+def log_to_mlflow(model, metrics, search_results, X_train, artifacts: dict):
+    """Registra parametros, metricas y artefactos del run principal."""
+    best_params = {k.replace("model__", ""): v for k, v in search_results.best_params_.items()}
+
+    mlflow.log_params({
+        **best_params,
+        "model_type": "XGBRegressor",
+        "target_transform": "log1p",
+        "search_method": "RandomizedSearchCV",
+        "search_n_iter": search_results.n_iter,
+        "cv_folds": search_results.cv,
+        "cv_scoring": search_results.scoring,
+        "random_seed": config.RANDOM_SEED,
+        "split_seed": config.SPLIT_SEED,
+        "test_size": config.TEST_SIZE,
+        "n_train_rows": len(X_train),
+        "n_features_input": X_train.shape[1],
+        "n_features_encoded": len(get_output_feature_names(model)),
+        "raw_features": ",".join(config.RAW_FEATURES),
+        "derived_features": ",".join(config.DERIVED_FEATURES),
+    })
+
+    flat_metrics = {}
+    for split in ("train", "validation"):
+        prefix = "train" if split == "train" else "val"
+        for key, value in metrics[split].items():
+            if value is not None and np.isfinite(value):
+                flat_metrics[f"{prefix}_{key}"] = float(value)
+    flat_metrics["cv_best_rmse_log"] = float(-search_results.best_score_)
+    flat_metrics["overfitting_r2_diff"] = float(metrics["overfitting_score"])
+    mlflow.log_metrics(flat_metrics)
+
+    mlflow.set_tags({
+        "selection_metric": config.MODEL_SELECTION_METRIC,
+        "selection_mode": config.MODEL_SELECTION_MODE,
+        "pipeline_stage": "training",
+        "dataset": "training_dataset",
+    })
+
+    # Modelo con signature: deja documentado el esquema de entrada esperado.
+    signature = mlflow.models.infer_signature(X_train, model.predict(X_train.head(5)))
+    mlflow.sklearn.log_model(
+        model,
+        name=config.MLFLOW_MODEL_ARTIFACT,
+        signature=signature,
+        input_example=X_train.head(5),
+        serialization_format="cloudpickle",
+    )
+
+    for path in artifacts.values():
+        if path and Path(path).exists():
+            mlflow.log_artifact(str(path))
+
+    return flat_metrics
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
 def main():
-    """Función principal para ejecutar el proceso de entrenamiento."""
-    
     try:
-        logger.info("Iniciando proceso de entrenamiento...")
+        logger.info("=" * 70)
+        logger.info("PIPELINE DE ENTRENAMIENTO")
+        logger.info("=" * 70)
+        logger.info("Configuracion efectiva:\n%s", config.describe())
 
-        # Paso 1: Conectar a la base de datos
-        engine = get_db_engine()
+        config.ensure_dirs()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # Paso 2: Cargar datos de entrenamiento
-        df = load_training_data(engine)
-        logger.info("Proceso de entrenamiento completado.")
-        
-        # Paso 3: Preparar features y target
-        logger.info("Preparando features y target...")
-        X, y_transformed, y_original = prepare_features_target(df)
-        
-        # Paso 4: Split train/validation
-        logger.info("Dividiendo datos en train y validation...")
-        X_train, X_val, y_train, y_val, y_train_orig, y_val_orig = split_data(X, y_transformed, y_original, test_size=0.2, random_state=43)
-        
-        # Paso 5 beta
-        preprocessor= create_preprocessor()
-        param_distributions = define_hyperparameter_grid()
-        
-        #Paso 5: Entrenar modelo con RandomizedSearchCV
-        logger.info("Entrenando modelo con RandomizedSearchCV...")
-        best_model,random_search = train_model(X_train, y_train)
-        
-        # Paso 6: Evaluar modelo
-        logger.info("Evaluando modelo en el set de validación...")
-        metrics, y_val_pred = evaluate_model(best_model, X_train, y_train, X_val, y_val, y_train_orig, y_val_orig)
-        
-        # Paso 7: Guardar modelo y metadata y estadisticas de training
-        logger.info("Guardando modelo y metadata...")
-        model_path = save_model(best_model, metrics, random_search.best_params_)
+        mlflow_utils.setup_tracking(config.MLFLOW_EXPERIMENT_TRAINING)
 
-        # Paso 8: Generar reportede evaluacion
-        report_path = generate_report(metrics, random_search.best_params_, random_search)
+        with mlflow.start_run(run_name=f"train_{timestamp}") as run:
+            run_id = run.info.run_id
+            logger.info("MLflow run iniciado: %s", run_id)
 
-        logger.info("\n" + "="*70)
-        logger.info("TRAINING PIPELINE COMPLETADO EXITOSAMENTE")
-        logger.info("="*70)
-        logger.info(f"\nModelo guardado en: {model_path}")
-        logger.info(f"Reporte generado en: {report_path}")
-        logger.info(f"\nValidation R²: {metrics['validation']['r2']:.4f}")
-        logger.info(f"Validation RMSE: ${metrics['validation']['rmse']:,.2f}")
+            # 1. Datos
+            engine = get_db_engine()
+            df = load_training_data(engine)
 
-        
+            # 2. Features y target
+            X, y_transformed, y_original = prepare_features_target(df)
+
+            # 3. Split
+            X_train, X_val, y_train, y_val, y_train_orig, y_val_orig = split_data(
+                X, y_transformed, y_original
+            )
+
+            # 4. Entrenamiento
+            best_model, search = train_model(X_train, y_train)
+            log_search_trials(search)
+
+            # 5. Evaluacion
+            metrics, y_val_pred = evaluate_model(
+                best_model, X_train, y_train, X_val, y_val, y_train_orig, y_val_orig
+            )
+
+            # 6. Artefactos locales
+            model_path, metadata_path = save_model(
+                best_model, metrics, search.best_params_, timestamp
+            )
+            report_path = generate_report(metrics, search.best_params_, search, timestamp)
+
+            cv_path = Path(config.RESULTS_DIR) / f"cv_results_{timestamp}.csv"
+            pd.DataFrame(search.cv_results_).to_csv(cv_path, index=False)
+
+            importance = compute_feature_importance(best_model)
+            importance_path = Path(config.RESULTS_DIR) / f"feature_importance_{timestamp}.json"
+            importance_path.write_text(json.dumps(importance, indent=2))
+            plot_path = plot_feature_importance(
+                importance, Path(config.RESULTS_DIR) / f"feature_importance_{timestamp}.png"
+            )
+
+            # 7. Baseline de monitoreo: viaja como artefacto DE ESTE run, de modo
+            #    que scoring siempre compare contra el baseline del modelo que usa.
+            baseline = monitoring.build_baseline(
+                X_train=X_train,
+                y_train_original=y_train_orig,
+                val_metrics={
+                    "rmse": metrics["validation"]["rmse"],
+                    "mae": metrics["validation"]["mae"],
+                    "r2": metrics["validation"]["r2"],
+                    "mape": metrics["validation"]["mape"],
+                },
+                val_predictions=y_val_pred,
+                extra={
+                    "training_run_id": run_id,
+                    "training_timestamp": timestamp,
+                    "target_transform": "log1p",
+                },
+            )
+            baseline_path = Path(config.RESULTS_DIR) / f"baseline_stats_{timestamp}.json"
+            monitoring.save_baseline(baseline, baseline_path)
+            mlflow.log_dict(baseline, config.BASELINE_ARTIFACT)
+            logger.info("Baseline de monitoreo registrado como artefacto '%s'",
+                        config.BASELINE_ARTIFACT)
+
+            # 8. MLflow
+            flat_metrics = log_to_mlflow(
+                best_model, metrics, search, X_train,
+                artifacts={
+                    "report": report_path,
+                    "metadata": metadata_path,
+                    "cv_results": cv_path,
+                    "importance": importance_path,
+                    "importance_plot": plot_path,
+                },
+            )
+
+            # 9. Model Registry
+            version = mlflow_utils.register_model_version(
+                run_id,
+                metrics={
+                    "val_rmse": flat_metrics["val_rmse"],
+                    "val_r2": flat_metrics["val_r2"],
+                    "overfitting_r2_diff": flat_metrics["overfitting_r2_diff"],
+                },
+            )
+
+        logger.info("=" * 70)
+        logger.info("TRAINING COMPLETADO")
+        logger.info("=" * 70)
+        logger.info("  MLflow run:        %s", run_id)
+        if version is not None:
+            logger.info("  Version registrada: %s v%s (alias '%s')",
+                        config.MLFLOW_MODEL_NAME, version.version, config.ALIAS_STAGING)
+        logger.info("  Modelo local:      %s", model_path)
+        logger.info("  Reporte:           %s", report_path)
+        logger.info("  Validation R2:     %.4f", metrics["validation"]["r2"])
+        logger.info("  Validation RMSE:   $%s", f"{metrics['validation']['rmse']:,.2f}")
+        logger.info("")
+        logger.info("  Ver los runs:  mlflow ui --backend-store-uri %s",
+                    config.MLFLOW_TRACKING_URI)
         return True
-    
-    
-    except Exception as e:
-        logger.error(f"\nError en el proceso de entrenamiento: {str(e)}", exc_info=True)
-        sys.exit(1)
-        
+
+    except Exception as exc:
+        logger.error("Error en el pipeline de entrenamiento: %s", exc, exc_info=True)
+        return False
+
+
 if __name__ == "__main__":
-    success = main()
-    sys.exit(0 if success else 1)
+    sys.exit(0 if main() else 1)

@@ -1,66 +1,98 @@
-version: '3.8'
+# =============================================================================
+# MetLife ML Ops Challenge
+#
+#   docker compose up --build        pipeline completo
+#   docker compose --profile ui up mlflow_ui   UI de MLflow en localhost:5000
+# =============================================================================
 
 services:
+
   postgres:
     image: postgres:15-alpine
     container_name: metlife_postgres
     restart: unless-stopped
-
     environment:
-      POSTGRES_DB: metlife_db
-      POSTGRES_USER: metlife_user
-      POSTGRES_PASSWORD: metlife_pass
+      POSTGRES_DB: ${DB_NAME:-metlife_db}
+      POSTGRES_USER: ${DB_USER:-metlife_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-metlife_pass}
       POSTGRES_INITDB_ARGS: "--encoding=UTF8"
-
     ports:
       - "5432:5432"
-
     volumes:
       - postgres_data:/var/lib/postgresql/data
-
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U metlife_user -d metlife_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-metlife_user} -d ${DB_NAME:-metlife_db}"]
       interval: 5s
       timeout: 5s
       retries: 5
-
     networks:
       - metlife_network
 
-# ML Pipeline
   ml_pipeline:
     build:
       context: .
       dockerfile: Dockerfile
-
     container_name: metlife_ml_pipeline
-    restart: on-failure
-
+    restart: "no"          # es un job por lotes, no un servicio: no se reinicia solo
     depends_on:
       postgres:
         condition: service_healthy
-
     environment:
-      # Database config
+      # --- Base de datos ---
       DB_HOST: postgres
       DB_PORT: ${DB_PORT:-5432}
       DB_NAME: ${DB_NAME:-metlife_db}
       DB_USER: ${DB_USER:-metlife_user}
       DB_PASSWORD: ${DB_PASSWORD:-metlife_pass}
 
-      # ML config
+      # --- MLflow ---
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-sqlite:///mlflow/mlflow.db}
+      MLFLOW_ARTIFACT_ROOT: ${MLFLOW_ARTIFACT_ROOT:-./mlruns}
+      MLFLOW_EXPERIMENT_TRAINING: ${MLFLOW_EXPERIMENT_TRAINING:-insurance-charges-training}
+      MLFLOW_EXPERIMENT_SCORING: ${MLFLOW_EXPERIMENT_SCORING:-insurance-charges-scoring}
+      MLFLOW_MODEL_NAME: ${MLFLOW_MODEL_NAME:-insurance-charges-xgb}
+
+      # --- Pipeline ---
       PYTHONUNBUFFERED: 1
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       HYPERPARAM_ITERATIONS: ${HYPERPARAM_ITERATIONS:-50}
       CV_FOLDS: ${CV_FOLDS:-5}
+      SCORING_MODE: ${SCORING_MODE:-prod}
       SCORING_SAMPLE_SIZE: ${SCORING_SAMPLE_SIZE:-10}
-
+      FAIL_ON_ALERT: ${FAIL_ON_ALERT:-false}
+      RUN_TESTS: ${RUN_TESTS:-true}
     volumes:
-      # Persistir outputs
+      # Datos de entrada montados en vez de solo copiados: permite agregar un
+      # lote nuevo en data/prod/ sin reconstruir la imagen.
+      - ./data:/app/data:ro
+      # Salidas persistentes
       - ./models:/app/models
       - ./results:/app/results
       - ./logs:/app/logs
+      # MLflow: sin estos dos volumenes, los experimentos se pierden al bajar
+      # el contenedor.
+      - ./mlruns:/app/mlruns
+      - ./mlflow:/app/mlflow
+    networks:
+      - metlife_network
 
+  # UI de MLflow. Va bajo un profile para que `docker compose up` corra el
+  # pipeline sin levantar ademas un servidor web.
+  mlflow_ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: metlife_mlflow_ui
+    profiles: ["ui"]
+    restart: unless-stopped
+    entrypoint: ["mlflow", "ui",
+                 "--backend-store-uri", "sqlite:///mlflow/mlflow.db",
+                 "--host", "0.0.0.0", "--port", "5000"]
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/app/mlruns
+      - ./mlflow:/app/mlflow
     networks:
       - metlife_network
 

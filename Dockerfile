@@ -1,30 +1,35 @@
-FROM python:3.10-slim AS builder
+# =============================================================================
+# MetLife ML Ops Challenge - imagen del pipeline
+# Multi-stage: las dependencias de compilacion no llegan a la imagen final.
+# =============================================================================
+
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-#Instalo dependencias de compilacion
-RUN apt-get update && apt-get install -y \
+# Dependencias de compilacion (psycopg2, xgboost)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-#Creo entorno virtual
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-#Instalo dependencias de python
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Stage 2 - Runtime
-FROM python:3.10-slim
 
-#Metadata
+# =============================================================================
+# Stage 2 - runtime
+# =============================================================================
+FROM python:3.11-slim
+
 LABEL maintainer="jm.aragonpaz@gmail.com" \
-      description="ML Engineering Challenge - MetLife" \
-      version="1.0"
+      description="ML Engineering Challenge - MetLife (MLflow + scoring batch + monitoreo)" \
+      version="2.0"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -32,36 +37,31 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-#Instalo dependencias de runtime
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
-#Copio entorno virtual desde builder
 COPY --from=builder /opt/venv /opt/venv
 
-#Copio codigo fuente
 COPY src/ /app/src/
+COPY tests/ /app/tests/
 COPY data/ /app/data/
 COPY entrypoint.sh .
 
-# Crear usuario no-root (seguridad)
 RUN groupadd -r appuser && \
     useradd -r -g appuser appuser && \
-    chown -R appuser:appuser /app && \
     chmod +x entrypoint.sh
 
-# Crear directorios para outputs
-RUN mkdir -p models results logs && \
-    chown -R appuser:appuser models results logs
+# Directorios de salida. `mlflow` guarda el backend SQLite del tracking y
+# `mlruns` los artefactos; ambos se montan como volumenes en docker-compose
+# para que los experimentos sobrevivan a `docker compose down`.
+RUN mkdir -p models results results/predictions logs mlruns mlflow && \
+    chown -R appuser:appuser /app
 
-# Cambiar a usuario no-root
 USER appuser
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "import sys; sys.exit(0)" || exit 1
+    CMD python -c "import mlflow, sklearn, xgboost; import sys; sys.exit(0)" || exit 1
 
-# Entrypoint
 ENTRYPOINT ["./entrypoint.sh"]

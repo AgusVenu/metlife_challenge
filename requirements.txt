@@ -1,0 +1,33 @@
+# ============================================================================
+# MetLife ML Ops Challenge - Dependencias
+# ----------------------------------------------------------------------------
+# Se usan rangos en vez de pines exactos porque el proyecto debe correr tanto
+# en Python 3.10 (Docker) como en 3.11 (entorno local de desarrollo).
+# ============================================================================
+
+# --- Core data / ML ---------------------------------------------------------
+pandas>=2.0,<3.0
+numpy>=1.24,<3.0
+# >=1.4 es obligatorio: el codigo usa sklearn.metrics.root_mean_squared_error
+scikit-learn>=1.4,<2.0
+xgboost>=2.0,<4.0
+scipy>=1.10,<2.0
+
+# --- MLOps ------------------------------------------------------------------
+# >=2.9 es obligatorio: se usan aliases del Model Registry (set_registered_model_alias)
+mlflow>=2.19,<4.0
+
+# --- Persistencia -----------------------------------------------------------
+SQLAlchemy>=2.0,<3.0
+psycopg2-binary>=2.9,<3.0
+joblib>=1.3,<2.0
+
+# --- Configuracion ----------------------------------------------------------
+python-dotenv>=1.0,<2.0
+
+# --- Visualizacion (EDA + feature importance) -------------------------------
+matplotlib>=3.7,<4.0
+seaborn>=0.13,<1.0
+
+# --- Testing ----------------------------------------------------------------
+pytest>=8.0,<9.0
