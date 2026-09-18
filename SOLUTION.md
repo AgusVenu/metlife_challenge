@@ -56,7 +56,8 @@ deliberados**. El pipeline los detecta y, más importante, los **distingue**:
 ### Requisitos
 
 - **Python 3.11** (MLflow 3.x requiere ≥ 3.10; el proyecto original apuntaba a 3.10)
-- **PostgreSQL 15+**
+- **PostgreSQL 15+** — se usan **dos bases**: `metlife_db` (datos y resultados
+  de negocio) y `mlflow_db` (backend de tracking de MLflow)
 - Opcionalmente **Docker** 20.10+
 
 ### Opción A — Local *(esta es la vía verificada)*
@@ -67,11 +68,14 @@ python3.11 -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip && pip install -r requirements.txt
 # (con uv:  uv venv --python 3.11 && uv pip install -r requirements.txt)
 
-# 2. Base de datos
-createdb metlife_db
-psql -d metlife_db -c "CREATE ROLE metlife_user LOGIN PASSWORD 'metlife_pass';
-                       GRANT ALL ON DATABASE metlife_db TO metlife_user;
-                       GRANT ALL ON SCHEMA public TO metlife_user;"
+# 2. Bases de datos (dos: la de negocio y la de tracking de MLflow)
+psql -d postgres -c "CREATE ROLE metlife_user LOGIN PASSWORD 'metlife_pass';"
+
+createdb -O metlife_user metlife_db
+psql -d metlife_db -c "GRANT ALL ON SCHEMA public TO metlife_user;"
+
+createdb -O metlife_user mlflow_db
+psql -d mlflow_db -c "GRANT ALL ON SCHEMA public TO metlife_user;"
 
 # 3. Configuración
 cp .env.template .env
@@ -155,12 +159,33 @@ búsqueda, para que quede trazada la exploración entera y no sólo el ganador.
 `MODEL_SELECTION_METRIC` / `MODEL_SELECTION_MODE`). Cada corrida registra una
 versión nueva en el Model Registry con alias `staging`.
 
+### Backend de tracking
+
+MLflow guarda los metadatos de los runs en **PostgreSQL** (`mlflow_db`) y los
+artefactos en el filesystem (`./mlruns`). Dos aclaraciones:
+
+- **Base separada de la de negocio.** MLflow crea **59 tablas** propias; ponerlas
+  en `metlife_db` junto a las 4 tablas de la aplicación (`training_dataset`,
+  `predictions`, `batch_predictions`, `batch_monitoring`) volvería ilegible el
+  esquema. Es el mismo servidor de Postgres, otra base.
+- **El URI se deriva de las credenciales `DB_*`,** para no duplicar la contraseña
+  en dos variables. Sólo hace falta setear `MLFLOW_TRACKING_URI` a mano para
+  apuntar a otro backend (un tracking server remoto, o SQLite en un entorno sin
+  Postgres); el código soporta ambos.
+
+Como el URI contiene credenciales, **nunca se imprime en claro**: los logs
+muestran la versión enmascarada (`postgresql+psycopg2://metlife_user:***@...`).
+
 ### Ver los runs
 
 ```bash
-mlflow ui --backend-store-uri sqlite:///mlflow/mlflow.db --port 5000
-# → http://localhost:5000
+./scripts/mlflow_ui.sh          # → http://127.0.0.1:5000
+./scripts/mlflow_ui.sh 5001     # en otro puerto
 ```
+
+El script resuelve el tracking URI desde `src/config.py` y se lo pasa a MLflow
+sin imprimirlo. Con backend PostgreSQL el URI contiene la contraseña, así que no
+puede quedar en un log ni en el historial del shell.
 
 ---
 
@@ -200,8 +225,8 @@ DECISION: NO promover la v3. Se mantiene en 'staging'.
 
 > **Nota sobre `Staging`/`Production`:** MLflow deprecó los *stages* en 2.9 y los
 > eliminó en 3.x. Se usan **aliases** (`staging`, `production`) más un tag `stage`
-> con el nombre clásico. Por eso el tracking URI es SQLite y no un file store: el
-> Model Registry necesita un backend con base de datos.
+> con el nombre clásico. El Model Registry necesita un backend con base de datos,
+> y por eso el tracking corre sobre **PostgreSQL** y no sobre un file store.
 
 ---
 
@@ -313,7 +338,8 @@ metlife-challenge-mlops/
 ├── + tests/                68 tests (pytest, sin DB ni MLflow)
 ├── data/                   Sin cambios: dataset.csv y los 3 lotes de prod/
 ├── notebooks/              Sin cambios: EDA original
-├── models/  results/  mlruns/  mlflow/     (generados)
+├── + scripts/              init-mlflow-db.sql y mlflow_ui.sh
+├── models/  results/  mlruns/             (generados)
 ├── + requirements.txt      Faltaba en el repo y rompía el build de Docker
 ├── ~ Dockerfile            Python 3.11, directorios de MLflow
 ├── ~ docker-compose.yaml   Volúmenes de MLflow y data, servicio mlflow_ui

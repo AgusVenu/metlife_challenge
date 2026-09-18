@@ -209,9 +209,45 @@ el reemplazo son los *aliases*, punteros con nombre a una versión concreta.
 `stage` con el nombre clásico (`Staging` / `Production`), para que la
 equivalencia con el enunciado quede explícita en la UI y en la base del registry.
 
-Esto obliga a un backend con base de datos: por eso `MLFLOW_TRACKING_URI` es
-`sqlite:///mlflow/mlflow.db` y no `file://./mlruns` — **el Model Registry no
-funciona con file store.**
+Esto obliga a un backend con base de datos — **el Model Registry no funciona con
+file store** — y por eso el tracking corre sobre PostgreSQL (ver § 2.11).
+
+### 2.11 PostgreSQL como backend de tracking, en una base separada
+
+**Decisión:** los metadatos de los runs viven en PostgreSQL (`mlflow_db`) y los
+artefactos en el filesystem (`./mlruns`).
+
+Dos razones para no usar un file store: el **Model Registry no funciona sin una
+base de datos**, y un file store no soporta escrituras concurrentes, así que dos
+corridas simultáneas del pipeline pueden corromperlo.
+
+**Por qué una base separada y no `metlife_db`:** MLflow crea **59 tablas** propias
+(`runs`, `metrics`, `params`, `registered_models`, `traces`, `scorers`,
+`webhooks`, …). La aplicación tiene 4 (`training_dataset`, `predictions`,
+`batch_predictions`, `batch_monitoring`). Mezclarlas haría que el esquema de
+negocio quedara enterrado, y complicaría dar permisos distintos o hacer backups
+por separado. Es el mismo servidor, otra base.
+
+**Consecuencia de seguridad que hubo que resolver:** a diferencia de un URI
+`sqlite://`, el URI de Postgres **contiene la contraseña**. El código lo logueaba
+en claro en tres lugares (`config.describe()`, `mlflow_utils.setup_tracking()` y
+el mensaje final de training y scoring). Ahora:
+
+- `config.mask_uri()` produce `MLFLOW_TRACKING_URI_SAFE`, y es esa la versión que
+  se loguea;
+- el URI se **deriva** de las credenciales `DB_*` en vez de duplicarse en otra
+  variable de entorno;
+- el mensaje final apunta a `./scripts/mlflow_ui.sh`, que resuelve el URI desde
+  `config.py` y se lo pasa a MLflow sin que aparezca en pantalla ni en el
+  historial del shell.
+
+`mlflow_utils._check_backend()` verifica la conexión al arrancar y, si la base no
+existe, devuelve el comando exacto para crearla en vez del error crudo de
+psycopg2.
+
+**Migración:** MLflow no ofrece migración entre backends. Los runs que hubiera en
+un `mlflow.db` de SQLite previo no se trasladan; el backend nuevo arranca vacío y
+se repuebla volviendo a correr el pipeline.
 
 ### 2.6 El drift se mide sobre las features crudas, no sobre las derivadas
 

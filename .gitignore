@@ -217,9 +217,8 @@ models/
 results/
 logs/
 
-# MLflow: backend SQLite + artifact store
+# MLflow: artifact store en disco (los metadatos van a PostgreSQL)
 mlruns/
-mlflow/
 mlartifacts/
 *.db
 

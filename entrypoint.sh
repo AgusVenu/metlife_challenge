@@ -71,7 +71,7 @@ run_step() {
 
 log_info "Configuracion:"
 log_info "  DB:                  $DB_USER@$DB_HOST/$DB_NAME"
-log_info "  MLflow tracking URI: ${MLFLOW_TRACKING_URI:-sqlite:///mlflow/mlflow.db}"
+log_info "  MLflow backend:      postgres://${DB_HOST}/${MLFLOW_DB_NAME:-mlflow_db}"
 log_info "  Modelo registrado:   ${MLFLOW_MODEL_NAME:-insurance-charges-xgb}"
 log_info "  Iteraciones HP:      ${HYPERPARAM_ITERATIONS:-50}"
 log_info "  CV folds:            ${CV_FOLDS:-5}"

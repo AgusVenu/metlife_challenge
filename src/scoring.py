@@ -426,8 +426,7 @@ def main() -> bool:
         logger.info("  Predicciones por lote -> %s", config.PREDICTIONS_DIR)
         logger.info("  Tablas: batch_predictions, batch_monitoring")
         logger.info("")
-        logger.info("  Ver los runs:  mlflow ui --backend-store-uri %s",
-                    config.MLFLOW_TRACKING_URI)
+        logger.info("  Ver los runs:  %s", config.mlflow_ui_command())
 
         if consolidated["overall_status"] == config.STATUS_ALERT and config.FAIL_ON_ALERT:
             logger.error("FAIL_ON_ALERT=true y hay lotes en ALERT: el pipeline termina con error.")

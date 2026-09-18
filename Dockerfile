@@ -53,10 +53,10 @@ RUN groupadd -r appuser && \
     useradd -r -g appuser appuser && \
     chmod +x entrypoint.sh
 
-# Directorios de salida. `mlflow` guarda el backend SQLite del tracking y
-# `mlruns` los artefactos; ambos se montan como volumenes en docker-compose
-# para que los experimentos sobrevivan a `docker compose down`.
-RUN mkdir -p models results results/predictions logs mlruns mlflow && \
+# Directorios de salida. Los metadatos de los runs viven en Postgres; `mlruns`
+# guarda los artefactos y se monta como volumen en docker-compose para que
+# sobrevivan a `docker compose down`.
+RUN mkdir -p models results results/predictions logs mlruns && \
     chown -R appuser:appuser /app
 
 USER appuser

@@ -30,9 +30,14 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 def setup_tracking(experiment_name: str) -> str:
-    """Configura tracking URI y experimento. Devuelve el experiment_id."""
+    """Configura tracking URI y experimento. Devuelve el experiment_id.
+
+    Falla con un mensaje accionable si el backend no esta disponible: con
+    Postgres, el error crudo de psycopg2 no dice que falta crear la base.
+    """
     Path(config.MLFLOW_ARTIFACT_ROOT).mkdir(parents=True, exist_ok=True)
     mlflow.set_tracking_uri(config.MLFLOW_TRACKING_URI)
+    _check_backend()
 
     client = MlflowClient()
     experiment = client.get_experiment_by_name(experiment_name)
@@ -45,8 +50,24 @@ def setup_tracking(experiment_name: str) -> str:
         logger.info("Experimento MLflow: %s (id=%s)", experiment_name, experiment_id)
 
     mlflow.set_experiment(experiment_name)
-    logger.info("MLflow tracking URI: %s", config.MLFLOW_TRACKING_URI)
+    logger.info("MLflow tracking URI: %s", config.MLFLOW_TRACKING_URI_SAFE)
     return experiment_id
+
+
+def _check_backend() -> None:
+    """Verifica que el backend de tracking responda."""
+    try:
+        MlflowClient().search_experiments(max_results=1)
+    except Exception as exc:
+        if config.MLFLOW_TRACKING_URI.startswith("postgresql"):
+            raise RuntimeError(
+                f"No se pudo conectar al backend de MLflow "
+                f"({config.MLFLOW_TRACKING_URI_SAFE}).\n"
+                f"Si la base todavia no existe, crearla con:\n"
+                f"    createdb -O {config.DB_USER} {config.MLFLOW_DB_NAME}\n"
+                f"Detalle: {exc}"
+            ) from exc
+        raise
 
 
 def get_client() -> MlflowClient:

@@ -8,6 +8,7 @@ parametrizar por completo desde el entorno (Docker, CI, etc).
 """
 
 import os
+import re
 from pathlib import Path
 
 try:
@@ -117,16 +118,34 @@ def get_db_url_safe() -> str:
 # MLflow
 # ============================================================================
 
-# SQLite (y no file://) porque el Model Registry requiere un backend con DB.
-_tracking_uri_raw = env_str("MLFLOW_TRACKING_URI", "sqlite:///mlflow/mlflow.db")
+# ----------------------------------------------------------------------------
+# Backend de tracking
+# ----------------------------------------------------------------------------
+# PostgreSQL, no file://, porque el Model Registry exige un backend con base de
+# datos. Se usa una base SEPARADA de la de negocio (`mlflow_db` vs `metlife_db`)
+# porque MLflow crea ~15 tablas propias (experiments, runs, metrics, params,
+# registered_models, ...) y mezclarlas con `training_dataset` o
+# `batch_monitoring` vuelve ilegible el esquema de la aplicacion.
+MLFLOW_DB_NAME = env_str("MLFLOW_DB_NAME", "mlflow_db")
+
+# El URI por defecto se DERIVA de las credenciales de la base para no duplicar
+# la password en dos variables de entorno distintas. Igual se puede pisar por
+# completo con MLFLOW_TRACKING_URI, por ejemplo para apuntar a un tracking
+# server remoto (http://...) o volver a sqlite en un entorno sin Postgres.
+_DEFAULT_TRACKING_URI = (
+    f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{MLFLOW_DB_NAME}"
+)
+
+_tracking_uri_raw = env_str("MLFLOW_TRACKING_URI", _DEFAULT_TRACKING_URI)
 
 
 def _absolutize_sqlite_uri(uri: str) -> str:
     """Hace absoluta la ruta de un URI sqlite relativo.
 
-    Sin esto, el archivo mlflow.db se crearia en el cwd del proceso, asi que
-    training y scoring podrian terminar apuntando a bases distintas segun desde
-    donde se los invoque.
+    Ya no es el backend por defecto, pero se conserva para que un override
+    explicito a `sqlite:///...` siga funcionando: sin esto el archivo se crearia
+    en el cwd del proceso y training y scoring podrian terminar apuntando a
+    bases distintas segun desde donde se los invoque.
     """
     prefix = "sqlite:///"
     if not uri.startswith(prefix):
@@ -139,7 +158,20 @@ def _absolutize_sqlite_uri(uri: str) -> str:
     return f"{prefix}{abs_path}"
 
 
+def mask_uri(uri: str) -> str:
+    """Enmascara la password de un URI de conexion, para poder loguearlo.
+
+    Con backend Postgres el tracking URI contiene credenciales, asi que no
+    puede imprimirse tal cual en logs, reportes ni mensajes de consola.
+    """
+    match = re.match(r"^(?P<scheme>[^:]+://)(?P<user>[^:/@]+):(?P<pwd>[^@]*)@(?P<rest>.*)$", uri)
+    if not match:
+        return uri
+    return f"{match.group('scheme')}{match.group('user')}:***@{match.group('rest')}"
+
+
 MLFLOW_TRACKING_URI = _absolutize_sqlite_uri(_tracking_uri_raw)
+MLFLOW_TRACKING_URI_SAFE = mask_uri(MLFLOW_TRACKING_URI)
 MLFLOW_ARTIFACT_ROOT = _resolve(env_str("MLFLOW_ARTIFACT_ROOT", "./mlruns"))
 
 MLFLOW_EXPERIMENT_TRAINING = env_str("MLFLOW_EXPERIMENT_TRAINING", "insurance-charges-training")
@@ -301,10 +333,21 @@ def describe() -> str:
     return "\n".join([
         f"  Project root:        {PROJECT_ROOT}",
         f"  DB:                  {get_db_url_safe()}",
-        f"  MLflow tracking URI: {MLFLOW_TRACKING_URI}",
+        f"  MLflow tracking URI: {MLFLOW_TRACKING_URI_SAFE}",
         f"  MLflow artifacts:    {MLFLOW_ARTIFACT_ROOT}",
         f"  Experimento train:   {MLFLOW_EXPERIMENT_TRAINING}",
         f"  Experimento scoring: {MLFLOW_EXPERIMENT_SCORING}",
         f"  Modelo registrado:   {MLFLOW_MODEL_NAME}",
         f"  Criterio de seleccion: {MODEL_SELECTION_METRIC} ({MODEL_SELECTION_MODE})",
     ])
+
+
+def mlflow_ui_command() -> str:
+    """Comando para levantar la UI de MLflow.
+
+    Con backend Postgres el tracking URI lleva la password, asi que no se puede
+    imprimir: se apunta al script, que lo resuelve desde este mismo modulo.
+    """
+    if MLFLOW_TRACKING_URI.startswith("postgresql"):
+        return "./scripts/mlflow_ui.sh"
+    return f"mlflow ui --backend-store-uri {MLFLOW_TRACKING_URI} --port 5000"

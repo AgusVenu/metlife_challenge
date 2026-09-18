@@ -20,6 +20,8 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Crea mlflow_db en el primer arranque (solo con el volumen vacio).
+      - ./scripts/init-mlflow-db.sql:/docker-entrypoint-initdb.d/10-init-mlflow-db.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-metlife_user} -d ${DB_NAME:-metlife_db}"]
       interval: 5s
@@ -46,7 +48,9 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-metlife_pass}
 
       # --- MLflow ---
-      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-sqlite:///mlflow/mlflow.db}
+      # El tracking URI se deriva de las credenciales DB_* de arriba apuntando
+      # a MLFLOW_DB_NAME; solo hace falta setearlo para usar otro backend.
+      MLFLOW_DB_NAME: ${MLFLOW_DB_NAME:-mlflow_db}
       MLFLOW_ARTIFACT_ROOT: ${MLFLOW_ARTIFACT_ROOT:-./mlruns}
       MLFLOW_EXPERIMENT_TRAINING: ${MLFLOW_EXPERIMENT_TRAINING:-insurance-charges-training}
       MLFLOW_EXPERIMENT_SCORING: ${MLFLOW_EXPERIMENT_SCORING:-insurance-charges-scoring}
@@ -69,10 +73,9 @@ services:
       - ./models:/app/models
       - ./results:/app/results
       - ./logs:/app/logs
-      # MLflow: sin estos dos volumenes, los experimentos se pierden al bajar
-      # el contenedor.
+      # Artefactos de MLflow. Los metadatos de los runs viven en Postgres, que
+      # ya persiste en su propio volumen.
       - ./mlruns:/app/mlruns
-      - ./mlflow:/app/mlflow
     networks:
       - metlife_network
 
@@ -85,14 +88,18 @@ services:
     container_name: metlife_mlflow_ui
     profiles: ["ui"]
     restart: unless-stopped
-    entrypoint: ["mlflow", "ui",
-                 "--backend-store-uri", "sqlite:///mlflow/mlflow.db",
-                 "--host", "0.0.0.0", "--port", "5000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MLFLOW_BACKEND_URI: >-
+        postgresql+psycopg2://${DB_USER:-metlife_user}:${DB_PASSWORD:-metlife_pass}@postgres:${DB_PORT:-5432}/${MLFLOW_DB_NAME:-mlflow_db}
+    entrypoint: ["/bin/sh", "-c",
+                 "mlflow ui --backend-store-uri \"$$MLFLOW_BACKEND_URI\" --host 0.0.0.0 --port 5000"]
     ports:
       - "5000:5000"
     volumes:
       - ./mlruns:/app/mlruns
-      - ./mlflow:/app/mlflow
     networks:
       - metlife_network
 

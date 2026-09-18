@@ -630,8 +630,7 @@ def main():
         logger.info("  Validation R2:     %.4f", metrics["validation"]["r2"])
         logger.info("  Validation RMSE:   $%s", f"{metrics['validation']['rmse']:,.2f}")
         logger.info("")
-        logger.info("  Ver los runs:  mlflow ui --backend-store-uri %s",
-                    config.MLFLOW_TRACKING_URI)
+        logger.info("  Ver los runs:  %s", config.mlflow_ui_command())
         return True
 
     except Exception as exc:
