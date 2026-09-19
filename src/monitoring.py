@@ -101,6 +101,47 @@ def regression_metrics(y_true, y_pred) -> Dict[str, float]:
     }
 
 
+def adjusted_r2(r2: float, n_samples: int, n_features: int) -> float:
+    """R2 ajustado por la cantidad de features codificadas."""
+    if not np.isfinite(r2) or not n_features or n_samples - n_features - 1 <= 0:
+        return float("nan")
+    return float(1 - (1 - r2) * (n_samples - 1) / (n_samples - n_features - 1))
+
+
+def canonical_metrics(y_true, y_pred, n_features: int = None) -> Dict[str, float]:
+    """Conjunto canonico de metricas de regresion.
+
+    Es la MISMA funcion en training y en scoring, para que las claves que se
+    loguean en MLflow sean comparables entre un run de entrenamiento y un lote
+    de produccion. Si cada pipeline definiera su propio set, comparar la
+    performance de validacion contra la de un lote seria imposible en la UI.
+
+    Devuelve las metricas en escala de dolares y en escala logaritmica. Las de
+    escala log se derivan de los valores en dolares con log1p, que da
+    exactamente los mismos numeros que evaluarlas en el espacio en el que
+    entrena el modelo, porque log1p(expm1(x)) == x.
+    """
+    base = regression_metrics(y_true, y_pred)
+
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    true_log = np.log1p(np.clip(y_true[mask], 0, None))
+    pred_log = np.log1p(np.clip(y_pred[mask], 0, None))
+
+    metrics = dict(base)
+    if len(true_log):
+        log_base = regression_metrics(true_log, pred_log)
+        metrics.update({
+            "rmse_log": log_base["rmse"],
+            "mae_log": log_base["mae"],
+            "r2_log": log_base["r2"],
+            "mape_log": log_base["mape"],
+        })
+    metrics["adj_r2"] = adjusted_r2(base["r2"], base["n_samples"], n_features)
+    return metrics
+
+
 # ============================================================================
 # PSI - Population Stability Index
 # ============================================================================
@@ -575,6 +616,7 @@ def monitor_batch(
     target=None,
     violations: List[Any] = None,
     model_info: Dict[str, Any] = None,
+    n_features: int = None,
 ) -> BatchReport:
     """Evalua todas las senales de un lote y devuelve su reporte consolidado."""
     baseline_metrics = baseline.get("metrics", {})
@@ -608,7 +650,7 @@ def monitor_batch(
     }
 
     if target is not None:
-        report.metrics = regression_metrics(target, predictions)
+        report.metrics = canonical_metrics(target, predictions, n_features)
         report.signals += evaluate_performance(report.metrics, baseline_metrics)
         report.signals += evaluate_target_drift(target, baseline)
 

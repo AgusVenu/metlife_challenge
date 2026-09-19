@@ -244,3 +244,56 @@ def test_to_dataframe_da_una_fila_por_lote(baseline, healthy_batch):
 
     assert list(df["batch_id"]) == ["prod1", "prod3"]
     assert df.loc[1, "rmse"] is None or pd.isna(df.loc[1, "rmse"])
+
+
+# ============================================================================
+# Metricas canonicas: el contrato que hace comparables training y scoring
+# ============================================================================
+
+def test_canonical_metrics_incluye_escala_dolar_y_log():
+    rng = np.random.default_rng(5)
+    y = rng.lognormal(9.2, 0.9, 400)
+    pred = y * rng.normal(1.0, 0.15, 400)
+    m = mon.canonical_metrics(y, pred, n_features=14)
+    assert set(m) >= {"rmse", "mae", "r2", "mape", "adj_r2",
+                      "rmse_log", "mae_log", "r2_log", "mape_log"}
+    assert all(np.isfinite(v) for k, v in m.items() if k != "n_samples")
+
+
+def test_las_metricas_log_coinciden_con_evaluar_en_el_espacio_del_modelo():
+    """log1p(expm1(x)) == x, asi que derivar las metricas log desde los dolares
+    da lo mismo que calcularlas en el espacio en el que entrena el modelo.
+
+    Es lo que permite que training y scoring compartan una sola funcion: training
+    tiene las predicciones en escala log y scoring solo en dolares.
+    """
+    rng = np.random.default_rng(6)
+    y_log = rng.normal(9.1, 0.9, 300)          # lo que ve el modelo
+    pred_log = y_log + rng.normal(0, 0.35, 300)
+
+    y_dolares = np.expm1(y_log)                 # lo que ve scoring
+    pred_dolares = np.expm1(pred_log)
+
+    directo = mon.regression_metrics(y_log, pred_log)
+    derivado = mon.canonical_metrics(y_dolares, pred_dolares)
+
+    assert derivado["rmse_log"] == pytest.approx(directo["rmse"], rel=1e-9)
+    assert derivado["r2_log"] == pytest.approx(directo["r2"], rel=1e-9)
+
+
+def test_training_y_scoring_producen_el_mismo_conjunto_de_claves(baseline, healthy_batch):
+    """Sin esto, comparar validacion contra un lote en la UI de MLflow es imposible."""
+    X, y, preds = healthy_batch
+
+    metricas_training = mon.canonical_metrics(y, preds, n_features=14)
+    reporte_scoring = mon.monitor_batch("lote", X, preds, baseline,
+                                        target=y, violations=[], n_features=14)
+
+    assert set(metricas_training) == set(reporte_scoring.metrics)
+    assert reporte_scoring.metrics["rmse"] == pytest.approx(metricas_training["rmse"])
+    assert np.isfinite(reporte_scoring.metrics["adj_r2"])
+
+
+def test_adjusted_r2_penaliza_mas_features():
+    assert mon.adjusted_r2(0.90, 1000, 5) > mon.adjusted_r2(0.90, 1000, 50)
+    assert np.isnan(mon.adjusted_r2(0.90, 10, 50))   # mas features que muestras

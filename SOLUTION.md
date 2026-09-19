@@ -87,7 +87,7 @@ cp .env.template .env
 
 ```bash
 # 4. Pipeline completo
-python -m pytest tests/ -q      # 68 tests, sin necesidad de DB ni MLflow
+python -m pytest tests/ -q      # 72 tests, sin necesidad de DB ni MLflow
 python src/db_setup.py          # crea el esquema y carga data/dataset.csv
 python src/training.py          # entrena y registra el run en MLflow
 python src/promote_model.py     # promueve a production si pasa los gates
@@ -141,6 +141,9 @@ filas y de features antes y después del one-hot.
 dólares como en escala logarítmica, más `cv_best_rmse_log` y
 `overfitting_r2_diff`.
 
+Además, las **19 métricas canónicas** sin prefijo, que son exactamente las mismas
+que loguea cada lote de scoring (ver abajo).
+
 **Artefactos**
 
 | Artefacto | Para qué sirve |
@@ -158,6 +161,25 @@ búsqueda, para que quede trazada la exploración entera y no sólo el ganador.
 **Criterio de mejor modelo:** `val_rmse` mínimo (configurable con
 `MODEL_SELECTION_METRIC` / `MODEL_SELECTION_MODE`). Cada corrida registra una
 versión nueva en el Model Registry con alias `staging`.
+
+### Métricas comparables entre entrenamiento y producción
+
+Training y scoring loguean **las mismas 19 claves**, calculadas por una única
+función compartida (`monitoring.canonical_metrics`), más un param `eval_dataset`
+que da el contexto. Eso permite graficar una sola serie en la UI de MLflow y ver
+la degradación de un vistazo:
+
+| `eval_dataset` | `rmse` | `r2` | `adj_r2` | `psi_max` |
+|---|---:|---:|---:|---:|
+| `validation` | $4.897,22 | 0,8310 | 0,8217 | 0,0587 |
+| `prod1` | $4.842,62 | 0,8455 | 0,8439 | 0,0406 |
+| `prod2` | $1.794.680,19 | −1,1221 | −1,1445 | 0,0406 |
+| `prod3` | n/d *(sin target)* | n/d | n/d | 11,7573 |
+
+Detalle a tener en cuenta al leer la tabla: el `psi_max` de `validation` es el
+PSI entre *train* y *validación*, o sea el **piso de ruido** del propio split.
+Que valga 0,0587 y `prod1` sólo 0,0406 confirma que `prod1` es genuinamente
+estable, y calibra el umbral: alertar por debajo de 0,06 sería alertar por ruido.
 
 ### Backend de tracking
 
@@ -335,7 +357,7 @@ metlife-challenge-mlops/
 │   │  ~ training.py        Entrenamiento + tracking + registro
 │   │  + promote_model.py   Promoción por métricas
 │   └  ~ scoring.py         Scoring batch + monitoreo
-├── + tests/                68 tests (pytest, sin DB ni MLflow)
+├── + tests/                72 tests (pytest, sin DB ni MLflow)
 ├── data/                   Sin cambios: dataset.csv y los 3 lotes de prod/
 ├── notebooks/              Sin cambios: EDA original
 ├── + scripts/              init-mlflow-db.sql y mlflow_ui.sh
@@ -356,7 +378,7 @@ metlife-challenge-mlops/
 ## Tests
 
 ```bash
-python -m pytest tests/ -q          # 68 tests
+python -m pytest tests/ -q          # 72 tests
 python -m pytest tests/ -v          # con el detalle de cada caso
 ```
 

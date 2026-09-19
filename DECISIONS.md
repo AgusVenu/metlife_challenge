@@ -249,6 +249,64 @@ psycopg2.
 un `mlflow.db` de SQLite previo no se trasladan; el backend nuevo arranca vacío y
 se repuebla volviendo a correr el pipeline.
 
+### 2.12 Métricas canónicas compartidas entre training y scoring
+
+**El enunciado no pide MLflow en scoring.** La sección 2 pide *"registrar
+resultados de scoring en un output reproducible (tabla en DB, CSV, o artefacto
+versionado)"*, y eso ya lo cubren `batch_predictions`, `batch_monitoring` y los
+CSV/JSON. Loguear además los runs de scoring a MLflow es un **agregado
+deliberado**: deja el historial de monitoreo consultable y comparable en el
+tiempo (`tags.monitoring_status = 'ALERT'` filtra los lotes con problema entre
+todas las corridas), que es la base para graficar la degradación como serie.
+
+**El problema que tenía ese agregado.** En la primera versión, training y
+scoring logueaban conjuntos de métricas **sin una sola clave en común**: 24 y 18
+respectivamente, cero solapamiento. Eso hacía imposible lo único que vuelve útil
+el agregado — poner en un mismo gráfico el RMSE de validación y el de cada lote.
+
+**Decisión:** una única función, `monitoring.canonical_metrics()`, que usan los
+dos pipelines, exactamente igual que ya compartían `feature_engineering()`. Cada
+run loguea las mismas 19 claves referidas a *su* dataset de evaluación, más un
+param `eval_dataset` (`validation`, `prod1`, `prod2`, …) que da el contexto:
+
+| Familia | Claves |
+|---|---|
+| Escala dólar | `rmse`, `mae`, `r2`, `adj_r2`, `mape` |
+| Escala log | `rmse_log`, `mae_log`, `r2_log`, `mape_log` |
+| Drift | `psi_age`, `psi_bmi`, `psi_children`, `psi_sex`, `psi_smoker`, `psi_region`, `psi_max` |
+| Datos y salida | `n_violations`, `pred_mean`, `pred_std` |
+
+Training conserva además las versiones prefijadas `train_*` / `val_*`, porque un
+run de training evalúa **dos** datasets y necesita distinguirlos; las claves sin
+prefijo refieren siempre al dataset de evaluación del run.
+
+**Las métricas log se derivan de los valores en dólares** con `log1p`, y dan
+exactamente los mismos números que evaluarlas en el espacio en el que entrena el
+modelo, porque `log1p(expm1(x)) == x`. Eso es lo que permite una sola función:
+training tiene las predicciones en escala log y scoring sólo en dólares. Hay un
+test que fija esa equivalencia.
+
+**Efecto secundario valioso.** Para poder loguear `psi_*` y `n_violations`,
+training ahora calcula el PSI entre train y validación, y valida los datos de
+entrenamiento contra el mismo contrato que se le exige a producción. Eso da dos
+cosas que antes no existían:
+
+- **El punto de referencia del PSI.** En la corrida actual, `psi_max` entre train
+  y validación es **0,0587**, mayor que el de `prod1` contra training (**0,0406**).
+  O sea: la variación entre las dos mitades del propio dataset de entrenamiento
+  es mayor que la del primer lote de producción. Eso confirma que `prod1` es
+  genuinamente estable y calibra el umbral: si un lote alerta con 0,06, estaría
+  alertando por debajo del ruido del split.
+- **Validación del dato de entrenamiento.** Un modelo entrenado sobre datos que
+  violan el contrato es un problema que antes no se detectaba en ningún lado.
+
+**Sobre los dos experimentos.** Con las métricas alineadas, unificar
+`insurance-charges-training` y `insurance-charges-scoring` en un solo experimento
+pasa a ser viable: ambos nombres son variables de entorno y los runs ya llevan el
+tag `pipeline_stage`. Se mantienen separados porque el experimento es la unidad
+de comparación de la UI y los ciclos de vida son distintos, pero la decisión ya
+no está forzada por la incompatibilidad de las métricas.
+
 ### 2.6 El drift se mide sobre las features crudas, no sobre las derivadas
 
 `bmi_squared`, `bmi_smoker`, `age_smoker`, etc. son funciones determinísticas de

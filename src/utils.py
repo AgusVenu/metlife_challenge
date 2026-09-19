@@ -63,3 +63,21 @@ def transform_target(y, inverse=False):
     else:
         # Aplicar log: log(charges + 1)
         return np.log1p(y)  # log1p(x) = log(1 + x)
+
+
+def get_encoded_feature_names(model):
+    """Nombres de las features DESPUES del ColumnTransformer (post one-hot).
+
+    La usan training y scoring para calcular el R2 ajustado con el ancho real
+    de la matriz que ve el modelo, y no con el numero de columnas de entrada.
+    """
+    try:
+        return list(model.named_steps["preprocessor"].get_feature_names_out())
+    except Exception:
+        return []
+
+
+def count_encoded_features(model, fallback=None):
+    """Cantidad de features codificadas, con fallback si el modelo no lo expone."""
+    names = get_encoded_feature_names(model)
+    return len(names) if names else fallback

@@ -36,7 +36,8 @@ import dashboard
 import data_loader
 import mlflow_utils
 import monitoring
-from utils import feature_engineering, get_db_engine, transform_target
+from utils import (count_encoded_features, feature_engineering, get_db_engine,
+                   transform_target)
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -233,6 +234,7 @@ def score_batch(batch, model, baseline, model_info, engine, timestamp):
             target=loaded.target if loaded.has_target else None,
             violations=loaded.all_violations,
             model_info={**model_info, "scoring_run_id": run.info.run_id},
+            n_features=count_encoded_features(model),
         )
 
         results = build_results_frame(batch.batch_id, loaded, predictions, model_info)
@@ -245,6 +247,7 @@ def score_batch(batch, model, baseline, model_info, engine, timestamp):
             "batch_id": batch.batch_id,
             "n_rows": loaded.n_rows,
             "has_target": loaded.has_target,
+            "eval_dataset": batch.batch_id,
             "features_file": Path(loaded.features_path).name,
             "target_file": Path(loaded.target_path).name if loaded.target_path else "n/a",
             "model_source": model_info.get("source"),

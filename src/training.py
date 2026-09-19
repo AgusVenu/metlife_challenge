@@ -44,7 +44,8 @@ from sklearn.preprocessing import OneHotEncoder
 import config
 import mlflow_utils
 import monitoring
-from utils import feature_engineering, get_db_engine, transform_target
+from utils import (count_encoded_features, feature_engineering, get_db_engine,
+                   get_encoded_feature_names, transform_target)
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -190,14 +191,6 @@ def train_model(X_train, y_train):
     return search.best_estimator_, search
 
 
-def get_output_feature_names(model):
-    """Nombres de las features DESPUES del ColumnTransformer (post one-hot)."""
-    try:
-        return list(model.named_steps["preprocessor"].get_feature_names_out())
-    except Exception:
-        return []
-
-
 # ============================================================================
 # Evaluacion
 # ============================================================================
@@ -214,39 +207,22 @@ def evaluate_model(model, X_train, y_train, X_val, y_val, y_train_original, y_va
     # Bug corregido: el R2 ajustado usaba la cantidad de columnas ANTES del
     # preprocesador, ignorando las dummies del one-hot. Se usa el ancho real
     # de la matriz que ve el modelo.
-    n_features = len(get_output_feature_names(model)) or X_train.shape[1]
+    n_features = count_encoded_features(model, fallback=X_train.shape[1])
 
-    def calculate_metrics(y_true_log, y_pred_log, y_true_original, y_pred_original, name):
-        rmse_log = root_mean_squared_error(y_true_log, y_pred_log)
-        mae_log = mean_absolute_error(y_true_log, y_pred_log)
-        r2_log = r2_score(y_true_log, y_pred_log)
-        # Bug corregido: el MAPE "log" del codigo original se calculaba con los
-        # valores en escala original, o sea que duplicaba el MAPE en dolares.
-        mape_log = float(np.mean(np.abs(
-            (np.asarray(y_true_log) - np.asarray(y_pred_log)) / np.asarray(y_true_log)
-        )) * 100)
-
-        base = monitoring.regression_metrics(y_true_original, y_pred_original)
-        n = len(y_true_original)
-        adj_r2 = 1 - (1 - base["r2"]) * (n - 1) / max(n - n_features - 1, 1)
-
-        metrics = {
-            "rmse_log": float(rmse_log), "mae_log": float(mae_log),
-            "r2_log": float(r2_log), "mape_log": mape_log,
-            "rmse": base["rmse"], "mae": base["mae"], "r2": base["r2"],
-            "adj_r2": float(adj_r2), "mape": base["mape"],
-        }
-
+    def calculate_metrics(y_true_original, y_pred_original, name):
+        # Mismo conjunto canonico que usa scoring, para que las claves logueadas
+        # en MLflow sean comparables entre validacion y los lotes de produccion.
+        metrics = monitoring.canonical_metrics(y_true_original, y_pred_original, n_features)
         logger.info("  %s SET:", name.upper())
         logger.info("    escala LOG  -> RMSE=%.4f  MAE=%.4f  R2=%.4f",
-                    rmse_log, mae_log, r2_log)
+                    metrics["rmse_log"], metrics["mae_log"], metrics["r2_log"])
         logger.info("    escala $    -> RMSE=$%s  MAE=$%s  R2=%.4f  adjR2=%.4f  MAPE=%.2f%%",
-                    f"{base['rmse']:,.2f}", f"{base['mae']:,.2f}",
-                    base["r2"], adj_r2, base["mape"])
+                    f"{metrics['rmse']:,.2f}", f"{metrics['mae']:,.2f}",
+                    metrics["r2"], metrics["adj_r2"], metrics["mape"])
         return metrics
 
-    train_metrics = calculate_metrics(y_train, y_train_pred_log, y_train_original, y_train_pred, "train")
-    val_metrics = calculate_metrics(y_val, y_val_pred_log, y_val_original, y_val_pred, "validation")
+    train_metrics = calculate_metrics(y_train_original, y_train_pred, "train")
+    val_metrics = calculate_metrics(y_val_original, y_val_pred, "validation")
 
     r2_diff = train_metrics["r2"] - val_metrics["r2"]
     logger.info("ANALISIS DE OVERFITTING: R2(train) - R2(val) = %.4f", r2_diff)
@@ -265,7 +241,7 @@ def evaluate_model(model, X_train, y_train, X_val, y_val, y_train_original, y_va
 
 def compute_feature_importance(model):
     """Importancia de features con los nombres reales post one-hot."""
-    names = get_output_feature_names(model)
+    names = get_encoded_feature_names(model)
     try:
         importances = model.named_steps["model"].feature_importances_
     except Exception:
@@ -459,7 +435,47 @@ def log_search_trials(search_results, top_n: int = 10):
             mlflow.set_tag("trial", "hyperparameter_search")
 
 
-def log_to_mlflow(model, metrics, search_results, X_train, artifacts: dict):
+def reference_monitoring_metrics(baseline, X_val, y_val_pred, X_train_raw):
+    """Metricas de monitoreo calculadas sobre validacion, en el run de training.
+
+    Son las MISMAS claves que loguea scoring (`psi_*`, `n_violations`,
+    `pred_mean`, `pred_std`), medidas contra el propio baseline. Cumplen dos
+    funciones:
+
+    1. Dan el punto de referencia del PSI. Si `psi_age` ya vale 0.08 entre train
+       y validacion, el umbral de WARNING (0.10) esta calibrado demasiado fino
+       para esa feature, y conviene saberlo antes de alertar en produccion.
+    2. Validan los datos de ENTRENAMIENTO contra el mismo contrato que se le
+       exige a produccion. Un modelo entrenado sobre datos que violan el
+       contrato es un problema que hoy no se detectaba en ningun lado.
+    """
+    import data_loader
+
+    _, psi_values = monitoring.evaluate_feature_drift(X_val, baseline)
+    violations = data_loader.validate_features(X_train_raw)
+
+    reference = {f"psi_{feature}": value for feature, value in psi_values.items()}
+    reference["psi_max"] = max(psi_values.values()) if psi_values else 0.0
+    reference["n_violations"] = len(violations)
+    reference["pred_mean"] = float(np.nanmean(y_val_pred))
+    reference["pred_std"] = float(np.nanstd(y_val_pred))
+
+    if violations:
+        logger.warning("Los datos de ENTRENAMIENTO violan el contrato de datos:")
+        for violation in violations:
+            logger.warning("  %s", violation)
+    if reference["psi_max"] > config.PSI_WARN:
+        logger.warning(
+            "PSI entre train y validacion = %.4f (> %.2f): el split no es "
+            "representativo y los umbrales de drift quedan mal calibrados.",
+            reference["psi_max"], config.PSI_WARN,
+        )
+
+    return reference
+
+
+def log_to_mlflow(model, metrics, search_results, X_train, artifacts: dict,
+                  reference_metrics: dict = None):
     """Registra parametros, metricas y artefactos del run principal."""
     best_params = {k.replace("model__", ""): v for k, v in search_results.best_params_.items()}
 
@@ -476,7 +492,8 @@ def log_to_mlflow(model, metrics, search_results, X_train, artifacts: dict):
         "test_size": config.TEST_SIZE,
         "n_train_rows": len(X_train),
         "n_features_input": X_train.shape[1],
-        "n_features_encoded": len(get_output_feature_names(model)),
+        "n_features_encoded": len(get_encoded_feature_names(model)),
+        "eval_dataset": "validation",
         "raw_features": ",".join(config.RAW_FEATURES),
         "derived_features": ",".join(config.DERIVED_FEATURES),
     })
@@ -487,6 +504,19 @@ def log_to_mlflow(model, metrics, search_results, X_train, artifacts: dict):
         for key, value in metrics[split].items():
             if value is not None and np.isfinite(value):
                 flat_metrics[f"{prefix}_{key}"] = float(value)
+
+    # Ademas de las prefijadas, se loguean las metricas SIN prefijo referidas al
+    # dataset de evaluacion del run (validacion). Scoring usa esas mismas claves
+    # para cada lote, asi que en la UI de MLflow se puede graficar una unica
+    # serie `rmse` y ver validacion -> prod1 -> prod2 en el mismo grafico.
+    for key, value in metrics["validation"].items():
+        if key != "n_samples" and value is not None and np.isfinite(value):
+            flat_metrics[key] = float(value)
+
+    if reference_metrics:
+        flat_metrics.update({k: float(v) for k, v in reference_metrics.items()
+                             if v is not None and np.isfinite(v)})
+
     flat_metrics["cv_best_rmse_log"] = float(-search_results.best_score_)
     flat_metrics["overfitting_r2_diff"] = float(metrics["overfitting_score"])
     mlflow.log_metrics(flat_metrics)
@@ -597,8 +627,12 @@ def main():
                         config.BASELINE_ARTIFACT)
 
             # 8. MLflow
+            reference_metrics = reference_monitoring_metrics(
+                baseline, X_val, y_val_pred, X_train
+            )
             flat_metrics = log_to_mlflow(
                 best_model, metrics, search, X_train,
+                reference_metrics=reference_metrics,
                 artifacts={
                     "report": report_path,
                     "metadata": metadata_path,
