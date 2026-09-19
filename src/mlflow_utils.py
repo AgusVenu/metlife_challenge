@@ -222,12 +222,19 @@ def resolve_model() -> ResolvedModel:
     # --- 3: mejor run del experimento de training ---
     logger.warning("No hay versiones en el Model Registry; se busca el mejor run de training.")
     order = "ASC" if config.MODEL_SELECTION_MODE == "min" else "DESC"
+    # El filtro por pipeline_stage es obligatorio: con training y scoring en el
+    # mismo experimento, sin el la busqueda podria devolver un run de scoring o
+    # un trial de la busqueda de hiperparametros, que no tienen modelo asociado.
+    filter_string = (
+        "attributes.status = 'FINISHED' "
+        f"and tags.pipeline_stage = '{config.STAGE_TRAINING}'"
+    )
     try:
         runs = mlflow.search_runs(
             experiment_names=[config.MLFLOW_EXPERIMENT_TRAINING],
             order_by=[f"metrics.{config.MODEL_SELECTION_METRIC} {order}"],
             max_results=1,
-            filter_string="attributes.status = 'FINISHED'",
+            filter_string=filter_string,
         )
     except Exception as exc:
         logger.warning("No se pudo consultar el experimento de training: %s", exc)

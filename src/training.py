@@ -432,7 +432,10 @@ def log_search_trials(search_results, top_n: int = 10):
                 "cv_train_rmse_log": float(-row["mean_train_score"]),
                 "rank": int(row["rank_test_score"]),
             })
-            mlflow.set_tag("trial", "hyperparameter_search")
+            mlflow.set_tags({
+                "pipeline_stage": config.STAGE_TRAINING_TRIAL,
+                "trial": "hyperparameter_search",
+            })
 
 
 def reference_monitoring_metrics(baseline, X_val, y_val_pred, X_train_raw):
@@ -524,7 +527,7 @@ def log_to_mlflow(model, metrics, search_results, X_train, artifacts: dict,
     mlflow.set_tags({
         "selection_metric": config.MODEL_SELECTION_METRIC,
         "selection_mode": config.MODEL_SELECTION_MODE,
-        "pipeline_stage": "training",
+        "pipeline_stage": config.STAGE_TRAINING,
         "dataset": "training_dataset",
     })
 

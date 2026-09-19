@@ -300,12 +300,43 @@ cosas que antes no existían:
 - **Validación del dato de entrenamiento.** Un modelo entrenado sobre datos que
   violan el contrato es un problema que antes no se detectaba en ningún lado.
 
-**Sobre los dos experimentos.** Con las métricas alineadas, unificar
-`insurance-charges-training` y `insurance-charges-scoring` en un solo experimento
-pasa a ser viable: ambos nombres son variables de entorno y los runs ya llevan el
-tag `pipeline_stage`. Se mantienen separados porque el experimento es la unidad
-de comparación de la UI y los ciclos de vida son distintos, pero la decisión ya
-no está forzada por la incompatibilidad de las métricas.
+### 2.13 Un único experimento de MLflow
+
+**Decisión revisada.** La primera versión usaba dos experimentos,
+`insurance-charges-training` e `insurance-charges-scoring`. El argumento era que
+el experimento es la unidad de comparación de la UI y que sus métricas no se
+solapaban — pero esa falta de solapamiento era un defecto del diseño, no una
+propiedad del problema, y se corrigió en § 2.12. Una vez que ambos lados loguean
+las mismas 19 claves, mantenerlos separados impide justamente lo que vuelve útil
+loguear el scoring: **ver validación y lotes de producción en el mismo gráfico.**
+
+Hoy todo va a **`insurance-charges`**, y los runs se distinguen por el tag
+`pipeline_stage`:
+
+| `pipeline_stage` | Qué es | `scope` |
+|---|---|---|
+| `training` | Run principal de entrenamiento | — |
+| `training_trial` | Cada combinación de la búsqueda de hiperparámetros | — |
+| `scoring` | Run de scoring | `all_batches` (padre) o `batch` |
+
+Eso habilita consultas directas en la UI, que antes requerían mirar dos
+experimentos:
+
+```
+tags.pipeline_stage = 'scoring' and metrics.psi_max > 0.25
+tags.monitoring_status = 'ALERT'
+```
+
+**Lo que hubo que blindar.** `resolve_model()` busca el mejor run por `val_rmse`
+cuando el Model Registry está vacío. Con todo en un experimento, esa búsqueda
+podía devolver un run de scoring o un trial de la búsqueda de hiperparámetros,
+ninguno de los cuales tiene un modelo asociado. Ahora el filtro incluye
+`tags.pipeline_stage = 'training'`, y por eso los trials anidados llevan
+`training_trial` y no `training`: nunca deben competir con el run principal.
+
+**Sigue siendo configurable.** `MLFLOW_EXPERIMENT` define el experimento único;
+setear `MLFLOW_EXPERIMENT_TRAINING` y `MLFLOW_EXPERIMENT_SCORING` por separado
+vuelve a dividirlos sin tocar código.
 
 ### 2.6 El drift se mide sobre las features crudas, no sobre las derivadas
 

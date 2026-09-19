@@ -174,8 +174,27 @@ MLFLOW_TRACKING_URI = _absolutize_sqlite_uri(_tracking_uri_raw)
 MLFLOW_TRACKING_URI_SAFE = mask_uri(MLFLOW_TRACKING_URI)
 MLFLOW_ARTIFACT_ROOT = _resolve(env_str("MLFLOW_ARTIFACT_ROOT", "./mlruns"))
 
-MLFLOW_EXPERIMENT_TRAINING = env_str("MLFLOW_EXPERIMENT_TRAINING", "insurance-charges-training")
-MLFLOW_EXPERIMENT_SCORING = env_str("MLFLOW_EXPERIMENT_SCORING", "insurance-charges-scoring")
+# Un unico experimento para entrenamiento y scoring. Training y scoring loguean
+# el mismo conjunto canonico de metricas (ver monitoring.canonical_metrics), asi
+# que sus runs SON comparables entre si: tenerlos juntos permite graficar una
+# sola serie `rmse` o `psi_bmi` y ver validacion -> prod1 -> prod2 en un mismo
+# grafico, que es el objetivo del monitoreo.
+#
+# Los runs se distinguen por el tag `pipeline_stage`:
+#     training         run principal de entrenamiento
+#     training_trial   cada combinacion de la busqueda de hiperparametros
+#     scoring          run de scoring (padre y por lote, ver el tag `scope`)
+#
+# Setear MLFLOW_EXPERIMENT_TRAINING y MLFLOW_EXPERIMENT_SCORING por separado
+# vuelve a dividirlos, sin tocar codigo.
+MLFLOW_EXPERIMENT = env_str("MLFLOW_EXPERIMENT", "insurance-charges")
+MLFLOW_EXPERIMENT_TRAINING = env_str("MLFLOW_EXPERIMENT_TRAINING", MLFLOW_EXPERIMENT)
+MLFLOW_EXPERIMENT_SCORING = env_str("MLFLOW_EXPERIMENT_SCORING", MLFLOW_EXPERIMENT)
+
+# Valores del tag que identifica el tipo de run.
+STAGE_TRAINING = "training"
+STAGE_TRAINING_TRIAL = "training_trial"
+STAGE_SCORING = "scoring"
 
 MLFLOW_MODEL_NAME = env_str("MLFLOW_MODEL_NAME", "insurance-charges-xgb")
 
@@ -335,8 +354,9 @@ def describe() -> str:
         f"  DB:                  {get_db_url_safe()}",
         f"  MLflow tracking URI: {MLFLOW_TRACKING_URI_SAFE}",
         f"  MLflow artifacts:    {MLFLOW_ARTIFACT_ROOT}",
-        f"  Experimento train:   {MLFLOW_EXPERIMENT_TRAINING}",
-        f"  Experimento scoring: {MLFLOW_EXPERIMENT_SCORING}",
+        f"  Experimento:         {MLFLOW_EXPERIMENT_TRAINING}"
+        + ("" if MLFLOW_EXPERIMENT_TRAINING == MLFLOW_EXPERIMENT_SCORING
+           else f" (scoring: {MLFLOW_EXPERIMENT_SCORING})"),
         f"  Modelo registrado:   {MLFLOW_MODEL_NAME}",
         f"  Criterio de seleccion: {MODEL_SELECTION_METRIC} ({MODEL_SELECTION_MODE})",
     ])

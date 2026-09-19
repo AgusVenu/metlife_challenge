@@ -129,8 +129,8 @@ docker compose down            # agregar -v para resetear también la DB
 python src/training.py
 ```
 
-Cada ejecución abre un run de MLflow en el experimento
-`insurance-charges-training` y registra:
+Cada ejecución abre un run de MLflow en el experimento `insurance-charges` y
+registra:
 
 **Parámetros** — hiperparámetros ganadores, semillas (`random_seed`,
 `split_seed`), `test_size`, folds de CV, iteraciones de la búsqueda, métrica de
@@ -161,6 +161,30 @@ búsqueda, para que quede trazada la exploración entera y no sólo el ganador.
 **Criterio de mejor modelo:** `val_rmse` mínimo (configurable con
 `MODEL_SELECTION_METRIC` / `MODEL_SELECTION_MODE`). Cada corrida registra una
 versión nueva en el Model Registry con alias `staging`.
+
+### Un solo experimento, tres tipos de run
+
+Entrenamiento y scoring comparten el experimento **`insurance-charges`**, porque
+loguean las mismas métricas y por lo tanto son comparables. Los runs se
+distinguen por el tag `pipeline_stage`:
+
+| `pipeline_stage` | Qué es |
+|---|---|
+| `training` | Run principal de entrenamiento |
+| `training_trial` | Cada combinación de la búsqueda de hiperparámetros (anidados) |
+| `scoring` | Run de scoring — el padre (`scope=all_batches`) y uno por lote (`scope=batch`) |
+
+Consultas útiles para pegar en el buscador de la UI:
+
+```
+tags.monitoring_status = 'ALERT'                              # lotes con problema
+tags.pipeline_stage = 'scoring' and metrics.psi_max > 0.25    # drift de entrada
+tags.pipeline_stage = 'training'                              # solo entrenamientos
+params.eval_dataset = 'prod1'                                 # la historia de un lote
+```
+
+Para separarlos de nuevo alcanza con setear `MLFLOW_EXPERIMENT_TRAINING` y
+`MLFLOW_EXPERIMENT_SCORING` por separado en el `.env`.
 
 ### Métricas comparables entre entrenamiento y producción
 
@@ -283,7 +307,7 @@ archivo `_target`, se procesa como batch sin etiquetas.
 | Dashboard | `results/monitoring_dashboard_<ts>.html` |
 | Predicciones en DB | tabla `batch_predictions` |
 | Monitoreo en DB | tabla `batch_monitoring` |
-| Runs de MLflow | experimento `insurance-charges-scoring` |
+| Runs de MLflow | experimento `insurance-charges` (tag `pipeline_stage=scoring`) |
 
 **Modo legacy:** `SCORING_MODE=sample python src/scoring.py` reproduce el
 comportamiento original (10 filas aleatorias de `training_dataset` → tabla

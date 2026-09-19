@@ -270,7 +270,8 @@ def score_batch(batch, model, baseline, model_info, engine, timestamp):
                             if v is not None and np.isfinite(v)})
 
         mlflow.set_tags({
-            "pipeline_stage": "scoring",
+            "pipeline_stage": config.STAGE_SCORING,
+            "scope": "batch",
             "batch_id": batch.batch_id,
             "monitoring_status": report.status,
             "has_target": str(loaded.has_target),
@@ -397,7 +398,8 @@ def main() -> bool:
 
         mlflow_utils.setup_tracking(config.MLFLOW_EXPERIMENT_SCORING)
         with mlflow.start_run(run_name=f"scoring_{timestamp}") as parent:
-            mlflow.set_tags({"pipeline_stage": "scoring", "scope": "all_batches"})
+            mlflow.set_tags({"pipeline_stage": config.STAGE_SCORING,
+                             "scope": "all_batches"})
             mlflow.log_params({
                 "model_source": model_info.get("source"),
                 "model_version": model_info.get("model_version"),
