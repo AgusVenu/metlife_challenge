@@ -4,17 +4,23 @@ El challenge pide explicitamente "una configuracion simple de experimento
 mediante variables de entorno o constantes centralizadas" y "evitar hardcodeos
 sensibles". Todo lo configurable del pipeline vive aca y se lee de os.environ
 con defaults razonables, de modo que el proyecto corra sin .env pero se pueda
-parametrizar por completo desde el entorno (Docker, CI, etc).
+parametrizar por completo desde el entorno (CI, orquestador, etc).
 """
 
+import json
+import logging
 import os
 import re
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - dotenv es dependencia declarada
     load_dotenv = None
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -32,8 +38,8 @@ def get_project_root() -> Path:
 
 PROJECT_ROOT = get_project_root()
 
-# Cargar .env de la raiz si existe (no pisa variables ya presentes en el entorno,
-# que es lo que queremos: en Docker manda docker-compose, en local manda .env).
+# Cargar .env de la raiz si existe. No pisa variables ya presentes en el entorno:
+# lo que exporte quien invoca el script (CI, orquestador) tiene prioridad sobre .env.
 if load_dotenv is not None:
     _dotenv = PROJECT_ROOT / ".env"
     if _dotenv.exists():
@@ -59,9 +65,10 @@ def env_int(key: str, default: int, *, fallback_key: str = None) -> int:
     """Lee un entero del entorno.
 
     `fallback_key` existe para tolerar el typo historico HIPERPARAM_ITERATIONS
-    (ver DECISIONS.md): docker-compose exporta HYPERPARAM_ITERATIONS pero el
-    codigo original leia HIPERPARAM_ITERATIONS, asi que la variable nunca tenia
-    efecto. Se acepta la correcta primero y la vieja como respaldo.
+    (ver DECISIONS.md): el entorno del proyecto original exportaba
+    HYPERPARAM_ITERATIONS pero el codigo leia HIPERPARAM_ITERATIONS, asi que la
+    variable nunca tenia efecto. Se acepta la correcta primero y la vieja como
+    respaldo.
     """
     raw = os.getenv(key)
     if raw in (None, "") and fallback_key:
@@ -89,6 +96,14 @@ def env_bool(key: str, default: bool = False) -> bool:
     if raw in (None, ""):
         return default
     return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def env_list(key: str, default: str) -> list:
+    """Lee una lista separada por comas, ignorando espacios y elementos vacios."""
+    raw = os.getenv(key)
+    if raw in (None, ""):
+        raw = default
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 # ============================================================================
@@ -123,7 +138,7 @@ def get_db_url_safe() -> str:
 # ----------------------------------------------------------------------------
 # PostgreSQL, no file://, porque el Model Registry exige un backend con base de
 # datos. Se usa una base SEPARADA de la de negocio (`mlflow_db` vs `metlife_db`)
-# porque MLflow crea ~15 tablas propias (experiments, runs, metrics, params,
+# porque MLflow crea 59 tablas propias (experiments, runs, metrics, params,
 # registered_models, ...) y mezclarlas con `training_dataset` o
 # `batch_monitoring` vuelve ilegible el esquema de la aplicacion.
 MLFLOW_DB_NAME = env_str("MLFLOW_DB_NAME", "mlflow_db")
@@ -181,9 +196,14 @@ MLFLOW_ARTIFACT_ROOT = _resolve(env_str("MLFLOW_ARTIFACT_ROOT", "./mlruns"))
 # grafico, que es el objetivo del monitoreo.
 #
 # Los runs se distinguen por el tag `pipeline_stage`:
-#     training         run principal de entrenamiento
-#     training_trial   cada combinacion de la busqueda de hiperparametros
-#     scoring          run de scoring (padre y por lote, ver el tag `scope`)
+#     training            run principal de entrenamiento: el del modelo GANADOR de la
+#                         comparacion entre familias. Es el unico que loguea el modelo
+#                         y el baseline, y el unico que `resolve_model()` considera.
+#     training_candidate  una familia evaluada en la comparacion (ver src/model_zoo.py).
+#                         Loguea solo metricas prefijadas train_*/val_*, nunca las
+#                         claves sin prefijo, que son la serie que cruza etapas.
+#     training_trial      cada combinacion de la busqueda de hiperparametros
+#     scoring             run de scoring (padre y por lote, ver el tag `scope`)
 #
 # Setear MLFLOW_EXPERIMENT_TRAINING y MLFLOW_EXPERIMENT_SCORING por separado
 # vuelve a dividirlos, sin tocar codigo.
@@ -193,10 +213,22 @@ MLFLOW_EXPERIMENT_SCORING = env_str("MLFLOW_EXPERIMENT_SCORING", MLFLOW_EXPERIME
 
 # Valores del tag que identifica el tipo de run.
 STAGE_TRAINING = "training"
+STAGE_TRAINING_CANDIDATE = "training_candidate"
 STAGE_TRAINING_TRIAL = "training_trial"
 STAGE_SCORING = "scoring"
 
-MLFLOW_MODEL_NAME = env_str("MLFLOW_MODEL_NAME", "insurance-charges-xgb")
+# El nombre designa la TAREA, no el algoritmo: desde que el entrenamiento compara
+# varias familias (src/model_zoo.py), un registry llamado "-xgb" sirviendo un
+# RandomForest seria enganoso. La familia de cada version queda en el tag
+# `model_family`. Para continuidad con las versiones ya registradas bajo el nombre
+# viejo, setear MLFLOW_MODEL_NAME=insurance-charges-xgb.
+MLFLOW_MODEL_NAME = env_str("MLFLOW_MODEL_NAME", "insurance-charges-regressor")
+
+# No registrar una version nueva si sus metricas son identicas a las de la ultima.
+# Sin esto, reentrenar tres veces con la misma semilla y los mismos datos -- que es lo
+# que uno hace verificando -- deja tres versiones indistinguibles en el Registry, y
+# cada version deja de significar algo. Ver mlflow_utils.register_model_version.
+REGISTER_SKIP_DUPLICATES = env_bool("REGISTER_SKIP_DUPLICATES", True)
 
 # Nombre del artefacto del modelo dentro de cada run.
 MLFLOW_MODEL_ARTIFACT = "model"
@@ -227,8 +259,29 @@ PROMOTION_MIN_IMPROVEMENT = env_float("PROMOTION_MIN_IMPROVEMENT", 0.0)
 # ============================================================================
 
 LOG_LEVEL = env_str("LOG_LEVEL", "INFO").upper()
+
+# Presupuesto de busqueda POR FAMILIA, no un total a repartir: cada familia corre
+# `round(HYPERPARAM_ITERATIONS * su n_iter_ratio)` iteraciones, topeadas por el
+# tamano de su grid (ver src/model_zoo.py). Con los ratios que trae el catalogo
+# (1.0 + 0.4 x 3) el default de 50 son 50+20+20+20 = 110 iteraciones en total.
+# Es el unico dial: bajarlo recorta las cuatro familias a la vez.
 HYPERPARAM_ITERATIONS = env_int("HYPERPARAM_ITERATIONS", 50, fallback_key="HIPERPARAM_ITERATIONS")
 CV_FOLDS = env_int("CV_FOLDS", 5)
+
+# Que familias se comparan. El orden de esta lista NO importa: `model_zoo.get_specs`
+# devuelve las familias en el orden del catalogo, y ese mismo orden es el que resuelve
+# los empates en la seleccion del mejor modelo (gana el incumbente, que va primero en
+# MODEL_SPECS). Un nombre desconocido aca hace fallar el entrenamiento a proposito.
+# TRAIN_MODEL_FAMILIES=xgboost reproduce exactamente el pipeline previo a la comparacion.
+TRAIN_MODEL_FAMILIES = env_list(
+    "TRAIN_MODEL_FAMILIES",
+    "xgboost,random_forest,hist_gradient_boosting,elasticnet",
+)
+
+# Cuantas combinaciones de la busqueda se loguean como runs anidados, por familia.
+# El cv_results_*.csv de cada familia ya conserva la busqueda entera; estos runs son
+# para hojear en la UI, y con cuatro familias 10 por cabeza no se hojean.
+TRIALS_TOP_N = env_int("TRIALS_TOP_N", 5)
 RANDOM_SEED = env_int("RANDOM_SEED", 42)
 SPLIT_SEED = env_int("SPLIT_SEED", 43)
 TEST_SIZE = env_float("TEST_SIZE", 0.2)
@@ -341,6 +394,212 @@ STATUS_ALERT = "ALERT"
 STATUS_ORDER = [STATUS_OK, STATUS_WARNING, STATUS_ALERT]
 
 
+# ============================================================================
+# Reglas de monitoreo por feature y por lote
+# ----------------------------------------------------------------------------
+# Los umbrales de arriba son el DEFAULT global. Este bloque permite afinarlos para
+# una feature puntual o para un lote puntual sin tocar codigo ni multiplicar
+# variables de entorno, que es lo que pasaria si cada feature necesitara su propia
+# PSI_WARN_BMI / PSI_ALERT_BMI / ...
+#
+# Precedencia, del mas especifico al mas general:
+#
+#     regla de (lote, feature)  >  regla de lote  >  regla de feature  >  default
+#
+# Que "lote" gane sobre "feature" es una decision: una regla de lote es una
+# afirmacion deliberada sobre un dataset concreto, y una de feature es un refinamiento
+# que vale para todos. Cuando las dos aplican y hay que ser explicito, la forma
+# inequivoca de resolverlo es escribir la regla de (lote, feature).
+#
+# Sin archivo de reglas, `resolve_thresholds()` devuelve siempre el default y el
+# comportamiento del monitoreo es identico al de antes de existir este bloque.
+# ============================================================================
+
+MONITORING_RULES_FILE = _resolve(env_str("MONITORING_RULES_FILE", "config/monitoring_rules.json"))
+
+
+@dataclass(frozen=True)
+class Thresholds:
+    """Umbrales ya resueltos para una senal concreta.
+
+    `source` dice de donde salio cada conjunto ("default", "feature:bmi",
+    "batch:prod3", "batch:prod3+feature:bmi"). Sin ese dato, un WARNING emitido con un
+    umbral custom es indistinguible de uno emitido con el global, y el reporte deja de
+    ser auditable.
+    """
+    psi_warn: float
+    psi_alert: float
+    perf_warn_ratio: float
+    perf_alert_ratio: float
+    r2_warn_drop: float
+    r2_alert_drop: float
+    target_shift_warn: float
+    target_shift_alert: float
+    schema_warn_pct: float
+    schema_alert_pct: float
+    # Resumen de TODAS las reglas que aportaron algo ("feature:bmi+batch:prod3").
+    source: str = "default"
+    # Procedencia por grupo de umbral. Hace falta porque dos reglas pueden pisar
+    # claves de grupos distintos -- una de feature los PSI y una de lote el umbral de
+    # esquema -- y entonces `source` nombra a las dos, pero la senal de drift la
+    # decidio solo una. Sin esto, el rastro de auditoria de cada senal seria
+    # aproximado justo donde promete ser exacto.
+    sources: Dict[str, str] = field(default_factory=dict)
+
+    def source_for(self, group: str) -> str:
+        """Que regla fijo los umbrales del grupo que decide ESTA senal."""
+        return self.sources.get(group, "default")
+
+    def to_dict(self) -> dict:
+        return {
+            "psi_warn": self.psi_warn, "psi_alert": self.psi_alert,
+            "perf_warn_ratio": self.perf_warn_ratio, "perf_alert_ratio": self.perf_alert_ratio,
+            "r2_warn_drop": self.r2_warn_drop, "r2_alert_drop": self.r2_alert_drop,
+            "target_shift_warn": self.target_shift_warn,
+            "target_shift_alert": self.target_shift_alert,
+            "schema_warn_pct": self.schema_warn_pct,
+            "schema_alert_pct": self.schema_alert_pct,
+            "source": self.source,
+            "sources": dict(self.sources),
+        }
+
+    @property
+    def is_custom(self) -> bool:
+        return self.source != "default"
+
+
+DEFAULT_THRESHOLDS = Thresholds(
+    psi_warn=PSI_WARN, psi_alert=PSI_ALERT,
+    perf_warn_ratio=PERF_WARN_RATIO, perf_alert_ratio=PERF_ALERT_RATIO,
+    r2_warn_drop=R2_WARN_DROP, r2_alert_drop=R2_ALERT_DROP,
+    target_shift_warn=TARGET_SHIFT_WARN, target_shift_alert=TARGET_SHIFT_ALERT,
+    schema_warn_pct=SCHEMA_WARN_PCT, schema_alert_pct=SCHEMA_ALERT_PCT,
+)
+
+# Cada senal de monitoreo depende de UN grupo de umbrales. La procedencia se
+# registra por grupo para que el reporte pueda decir, de cada senal, exactamente que
+# regla fijo el umbral que la decidio.
+THRESHOLD_GROUPS = {
+    "psi": ("psi_warn", "psi_alert"),
+    "perf": ("perf_warn_ratio", "perf_alert_ratio"),
+    "r2": ("r2_warn_drop", "r2_alert_drop"),
+    "target_shift": ("target_shift_warn", "target_shift_alert"),
+    "schema": ("schema_warn_pct", "schema_alert_pct"),
+}
+_GROUP_OF_FIELD = {f: g for g, fields in THRESHOLD_GROUPS.items() for f in fields}
+
+_THRESHOLD_FIELDS = frozenset(_GROUP_OF_FIELD)
+
+_rules_cache: Optional[Dict[str, Any]] = None
+
+
+def load_rules(path=None, force: bool = False) -> Dict[str, Any]:
+    """Lee el archivo de reglas. Cachea el resultado en memoria.
+
+    Un archivo ausente es el caso NORMAL y devuelve {}. Un archivo presente pero mal
+    formado devuelve {} con un WARNING: un JSON roto no debe tumbar un pipeline de
+    scoring que por lo demas puede correr perfectamente con los umbrales globales.
+    """
+    global _rules_cache
+    if path is None and _rules_cache is not None and not force:
+        return _rules_cache
+
+    target = Path(path or MONITORING_RULES_FILE)
+    rules: Dict[str, Any] = {}
+    if target.exists():
+        try:
+            loaded = json.loads(target.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                rules = loaded
+            else:
+                logger.warning("El archivo de reglas %s no contiene un objeto JSON; se ignora.",
+                               target)
+        except Exception as exc:
+            logger.warning("No se pudo leer el archivo de reglas %s (%s). "
+                           "Se usan los umbrales globales.", target, exc)
+
+    if path is None:
+        _rules_cache = rules
+    return rules
+
+
+def _overrides(block: Any) -> Dict[str, float]:
+    """Extrae de un bloque de reglas solo las claves que son umbrales conocidos."""
+    if not isinstance(block, dict):
+        return {}
+    out = {}
+    for key, value in block.items():
+        if key in _THRESHOLD_FIELDS:
+            try:
+                out[key] = float(value)
+            except (TypeError, ValueError):
+                logger.warning("Umbral '%s' con valor no numerico (%r); se ignora.", key, value)
+    return out
+
+
+def _block(container: Any, key: str) -> Dict[str, Any]:
+    """Saca un sub-bloque de reglas, tolerando que no sea un dict.
+
+    Todo lo que venga de un archivo escrito a mano puede estar mal formado en
+    cualquier nivel, no solo en la raiz. Sin esta guarda, un
+    `{"batches": {"prod3": 0.05}}` revienta con AttributeError dentro de
+    `monitor_batch`; como `run_prod_scoring` atrapa la excepcion por lote, el
+    resultado seria que TODOS los lotes quedan en ALERT con "no pudo procesarse",
+    sin predicciones monitoreadas ni reconciliacion de alertas. Un typo en un
+    archivo de configuracion no debe poner en rojo una corrida entera: debe caer a
+    los umbrales globales.
+    """
+    if not isinstance(container, dict) or not key:
+        return {}
+    value = container.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        logger.warning("Bloque de reglas '%s' mal formado (se esperaba un objeto, "
+                       "vino %s); se ignora.", key, type(value).__name__)
+        return {}
+    return value
+
+
+def resolve_thresholds(batch_id: str = None, feature: str = None,
+                       rules: Dict[str, Any] = None) -> Thresholds:
+    """Resuelve los umbrales efectivos para un lote y/o una feature."""
+    rules = load_rules() if rules is None else rules
+    if not isinstance(rules, dict) or not rules:
+        return DEFAULT_THRESHOLDS
+
+    thresholds, origin, sources = DEFAULT_THRESHOLDS, [], {}
+
+    def aplicar(block, etiqueta):
+        """Aplica un bloque de reglas y anota de que grupo(s) se hizo cargo."""
+        nonlocal thresholds
+        overrides = _overrides(block)
+        if not overrides:
+            return
+        thresholds = replace(thresholds, **overrides)
+        origin.append(etiqueta)
+        for key in overrides:
+            sources[_GROUP_OF_FIELD[key]] = etiqueta
+
+    # De menos a mas especifico: el ultimo que toca un grupo es el que manda sobre el.
+    aplicar(_block(_block(rules, "features"), feature), f"feature:{feature}")
+
+    batch_block = _block(_block(rules, "batches"), batch_id)
+    if batch_block:
+        aplicar(batch_block, f"batch:{batch_id}")
+        aplicar(_block(_block(batch_block, "features"), feature),
+                f"batch:{batch_id}/feature:{feature}")
+
+    if not origin:
+        return DEFAULT_THRESHOLDS
+
+    # `source` resume TODAS las reglas que aportaron algo; `sources` dice, grupo por
+    # grupo, cual fijo el umbral que efectivamente decide cada senal. Reportar solo
+    # la ultima regla -- o solo el resumen -- dejaria el rastro de auditoria
+    # apuntando a una regla que no aporto el umbral que disparo.
+    return replace(thresholds, source="+".join(origin), sources=sources)
+
+
 def ensure_dirs() -> None:
     """Crea los directorios de salida. Idempotente."""
     for directory in (MODELS_DIR, RESULTS_DIR, PREDICTIONS_DIR, MLFLOW_ARTIFACT_ROOT):
@@ -358,6 +617,7 @@ def describe() -> str:
         + ("" if MLFLOW_EXPERIMENT_TRAINING == MLFLOW_EXPERIMENT_SCORING
            else f" (scoring: {MLFLOW_EXPERIMENT_SCORING})"),
         f"  Modelo registrado:   {MLFLOW_MODEL_NAME}",
+        f"  Familias a comparar: {', '.join(TRAIN_MODEL_FAMILIES)}",
         f"  Criterio de seleccion: {MODEL_SELECTION_METRIC} ({MODEL_SELECTION_MODE})",
     ])
 

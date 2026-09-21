@@ -1,0 +1,90 @@
+{
+  "_comment": [
+    "Reglas de monitoreo por feature y por lote. Los valores de aca PISAN a los",
+    "umbrales globales de .env / src/config.py para las senales que nombran.",
+    "",
+    "Precedencia, del mas especifico al mas general:",
+    "    (lote, feature)  >  lote  >  feature  >  default global",
+    "",
+    "Borrar este archivo es seguro: sin el, todo se mide con los umbrales globales y",
+    "el comportamiento es el de antes de que existieran las reglas. Cada excepcion",
+    "aplicada queda impresa en el reporte de monitoreo, con el nombre de la regla.",
+    "",
+    "Claves de umbral validas: psi_warn, psi_alert, perf_warn_ratio, perf_alert_ratio,",
+    "r2_warn_drop, r2_alert_drop, target_shift_warn, target_shift_alert,",
+    "schema_warn_pct, schema_alert_pct."
+  ],
+
+  "features": {
+    "bmi": {
+      "_comment": [
+        "Mas estricto que el default (0.10 / 0.25). Dos razones concretas:",
+        "1. Es la feature de mayor peso en el modelo, y ademas entra tres veces:",
+        "   bmi, bmi_squared y bmi_smoker son funcion de ella. Un corrimiento chico",
+        "   en bmi se amplifica en las derivadas y en la prediccion.",
+        "2. Es la que efectivamente se corrompe en produccion: en prod3 perdio el",
+        "   punto decimal (27.929 -> 27929). Vale detectar el problema antes de que",
+        "   llegue a ese extremo."
+      ],
+      "psi_warn": 0.05,
+      "psi_alert": 0.15
+    },
+
+    "sex": {
+      "_comment": [
+        "Mas laxo. Es binaria y esta balanceada ~50/50 en training: con lotes de",
+        "~1300 filas, el PSI de una binaria balanceada oscila por muestreo y un",
+        "WARNING a 0.10 seria ruido, no senal. Ademas un corrimiento en la mezcla de",
+        "genero no es accionable por si solo: lo que importaria es que arrastre",
+        "performance, y eso ya lo cubren las senales de performance."
+      ],
+      "psi_warn": 0.20,
+      "psi_alert": 0.40
+    },
+
+    "region": {
+      "_comment": [
+        "Mismo criterio que sex: categorica de 4 niveles casi uniformes (~25% cada",
+        "uno). El PSI sobre pocas categorias balanceadas es ruidoso, y la region es",
+        "la variable con menor peso en el modelo."
+      ],
+      "psi_warn": 0.20,
+      "psi_alert": 0.40
+    }
+  },
+
+  "batches": {
+    "prod3": {
+      "_comment": [
+        "prod3 llega SIN ground truth. Eso significa que no hay red de seguridad",
+        "aguas abajo: las senales de performance (rmse_ratio, r2_drop) y de desvio",
+        "del target no se pueden calcular, asi que la unica evidencia disponible es",
+        "la entrada y la distribucion de predicciones.",
+        "",
+        "Cuando la unica evidencia es la entrada, la vara sobre la entrada se endurece:",
+        "un drift moderado que en prod1 se toleraria porque el RMSE lo desmentiria,",
+        "aca no se puede desmentir con nada."
+      ],
+      "psi_warn": 0.05,
+      "psi_alert": 0.15,
+
+      "features": {
+        "sex": {
+          "_comment": [
+            "La regla de lote (0.05/0.15) seria demasiado estricta para una binaria",
+            "balanceada y volveria a meter el ruido que la regla de feature evitaba.",
+            "Esta regla de (lote, feature) es la unica forma inequivoca de resolverlo,",
+            "porque lote gana sobre feature."
+          ],
+          "psi_warn": 0.20,
+          "psi_alert": 0.40
+        },
+        "region": {
+          "_comment": ["Mismo motivo que sex."],
+          "psi_warn": 0.20,
+          "psi_alert": 0.40
+        }
+      }
+    }
+  }
+}

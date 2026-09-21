@@ -199,6 +199,27 @@ Si el entrenamiento promoviera solo, cualquier corrida experimental pasaría a
 servir en producción. La decisión queda registrada en los tags de la versión
 (`promoted_at`, `promoted_by`, `promotion_reason`) y explicada en el log.
 
+### 2.4.1 Evidencia real de los gates: un candidato rechazado
+
+Los gates no son decorativos. Durante el desarrollo, un entrenamiento produjo un
+candidato **peor** que el modelo en producción y `promote_model.py` lo rechazó. El
+texto quedó escrito en el tag `promotion_reason` de esa versión:
+
+```
+OK: val_r2=0.8250 >= 0.75
+OK: overfitting=0.0769 < 0.15
+RECHAZO: val_rmse=4,983.39 > umbral 4,897.22 (produccion=4,897.22);
+         el candidato no mejora al modelo actual
+```
+
+La versión quedó en `staging` con `promotion_rejected_at`, y producción siguió
+sirviendo el modelo anterior. Es el comportamiento que justifica separar *registrar*
+de *promover* (§ 2.4): sin esa separación, ese entrenamiento habría pisado un modelo
+mejor.
+
+> El Registry se limpió después de la etapa de desarrollo y esa versión ya no está;
+> el texto se conserva acá porque es la evidencia de que el gate relativo funciona.
+
 ### 2.5 Aliases en lugar de stages
 
 El enunciado pide etapas `Staging`/`Production`. **MLflow deprecó los stages en
@@ -315,7 +336,8 @@ Hoy todo va a **`insurance-charges`**, y los runs se distinguen por el tag
 
 | `pipeline_stage` | Qué es | `scope` |
 |---|---|---|
-| `training` | Run principal de entrenamiento | — |
+| `training` | Run principal: el modelo **ganador** de la comparación entre familias | — |
+| `training_candidate` | Una familia evaluada en esa comparación (ver § 2.14) | — |
 | `training_trial` | Cada combinación de la búsqueda de hiperparámetros | — |
 | `scoring` | Run de scoring | `all_batches` (padre) o `batch` |
 
@@ -337,6 +359,279 @@ ninguno de los cuales tiene un modelo asociado. Ahora el filtro incluye
 **Sigue siendo configurable.** `MLFLOW_EXPERIMENT` define el experimento único;
 setear `MLFLOW_EXPERIMENT_TRAINING` y `MLFLOW_EXPERIMENT_SCORING` por separado
 vuelve a dividirlos sin tocar código.
+
+### 2.14 El mejor modelo se elige entre familias, no sólo entre hiperparámetros
+
+**El problema.** El proyecto entrenaba una sola familia (XGBoost) y justificaba la
+elección con un párrafo escrito a mano en el `training_report`. Los 10 runs
+anidados que quedaban en MLflow eran variantes del mismo modelo: eso es una
+comparación de **hiperparámetros**, no de modelos. "El mejor modelo" nunca se
+eligió entre alternativas reales.
+
+**La decisión.** Cada ejecución entrena cuatro familias sobre el mismo split, y el
+criterio de selección que ya existía (`MODEL_SELECTION_METRIC`) pasa a aplicarse
+también entre ellas. El catálogo vive en `src/model_zoo.py` como una tabla de
+datos, aparte de `training.py`, para poder revisarlo de un vistazo y testearlo sin
+MLflow ni PostgreSQL.
+
+**Por qué esas cuatro.** Cada una responde una pregunta distinta, y eso está
+declarado en el campo `rationale` de su spec:
+
+| Familia | Pregunta que responde |
+|---|---|
+| `xgboost` | Es el incumbente: la referencia a batir, con su grid original intacto |
+| `random_forest` | ¿El problema tiene la señal secuencial que el boosting supone? |
+| `hist_gradient_boosting` | ¿La ventaja es del boosting o de la implementación de XGBoost? |
+| `elasticnet` | ¿La complejidad no lineal aporta algo, o sólo lo suponíamos? |
+
+**`HistGradientBoostingRegressor` en lugar de LightGBM.** Cumple el mismo rol
+—otra implementación de boosting con binning de histogramas— y ya viene en
+`scikit-learn`. Agregar `lightgbm` o `catboost` sumaría dependencias sin aportar
+una familia conceptualmente distinta de las que ya están. El costo: no expone
+`feature_importances_`, así que si llegara a ganar, esa corrida no genera gráfico
+de importancia. Es una degradación explícita y documentada, no un fallo.
+
+**El escalado no es un detalle.** `create_preprocessor()` hacía `passthrough` de
+las numéricas. Entre ellas conviven `age_squared` (hasta ~10.000) y `children`
+(hasta 5): con esas escalas, la penalización L1/L2 de `ElasticNet` castiga
+desparejo y la evaluación de la familia lineal no sería honesta. Por eso sólo esa
+familia declara `needs_scaling=True`. Los modelos de árboles son invariantes a la
+escala y conservan el `passthrough` original **bit a bit**, que es lo que permite
+comparar la corrida de XGBoost contra sus métricas ya documentadas.
+
+**Jerarquía de runs: los candidatos no loguean modelo.** El run padre `training` es
+el del ganador y es el único con artefacto de modelo. `resolve_model()` busca el
+mejor run con `pipeline_stage='training'`; con este esquema hay **exactamente uno
+por ejecución**, así que esa consulta no cambió una línea y sigue siendo correcta.
+Que los candidatos no tengan modelo hace *imposible* resolver a uno de ellos por
+accidente, aun si alguien aflojara ese filtro. Lo que sí queda de cada candidato es
+su `best_params_` y su `cv_results_` completo: son reproducibles desde la semilla.
+
+**Los candidatos tampoco escriben las métricas sin prefijo.** `rmse`, `r2`, `mape`
+y `psi_*` son la serie que cruza etapas (§ 2.12). Si cuatro candidatos las
+escribieran, el gráfico de validación → prod1 → prod2 dejaría de significar lo que
+§ 2.12 y § 2.13 dicen que significa. Los candidatos usan `val_*` y `train_*`; el
+run padre agrega una métrica `family_<nombre>_val_rmse` por familia, para que su
+fila en la tabla de la UI muestre la comparación completa sin abrir los hijos.
+
+**El sesgo de selección, asumido y visible.** Elegir entre cuatro familias por una
+métrica medida sobre el **mismo** conjunto de validación es una comparación
+múltiple: el ganador se lleva algo de ventaja por azar. Lo estadísticamente más
+prolijo sería elegir por CV y reportar validación como estimación honesta. **No se
+hizo**, porque `resolve_model()` ordena por `metrics.val_rmse` y `promote_model.py`
+compara por `val_rmse`: usar un criterio local distinto rompería la coherencia del
+sistema por una ganancia marginal con cuatro candidatos. La mitigación es un
+WARNING explícito cuando el ranking por CV discrepa del ranking por validación.
+
+En la corrida de referencia **ese caso se dio**: gana `random_forest` por
+`val_rmse` ($4.800,25 vs $4.897,22) pero `xgboost` tiene mejor RMSE de CV (0,3522
+vs 0,3599). El margen no es sólido, y el pipeline lo dice en vez de esconderlo.
+
+**Un entrenamiento idéntico no registra versión nueva.** El Registry es un log de
+*qué se entrenó*, y `training.py` registra en cada corrida. Pero reentrenar con la
+misma semilla y los mismos datos —que es exactamente lo que uno hace verificando—
+produce el mismo modelo, y registrarlo otra vez hace que cada versión deje de
+significar algo: durante el desarrollo el Registry acumuló tres versiones con las 45
+métricas idénticas. `register_model_version` compara ahora la familia y las métricas
+de selección contra la última versión y, si coinciden, devuelve la existente con un
+WARNING explícito en vez de crear una nueva.
+
+La limitación está asumida y documentada en el código: si cambia el código pero las
+métricas no se mueven, el cambio no se detecta. El run igual queda trazado entero en
+MLflow con sus artefactos —lo único que se saltea es la entrada en el Registry— y el
+comportamiento se apaga con `REGISTER_SKIP_DUPLICATES=false`.
+
+**Costo de cómputo.** `HYPERPARAM_ITERATIONS` dejó de ser el `n_iter` absoluto y
+pasó a ser un presupuesto **por familia** —no un total a repartir: con los ratios
+del catálogo (1,0 + 0,4×3), 50 se traduce en 110 iteraciones en total—;
+cada familia declara qué fracción consume,
+topeada por la cardinalidad de su grid (sin ese tope, `elasticnet` —20
+combinaciones— recibiría 50 iteraciones: `ParameterSampler` las recorta igual, pero
+deja un número que no es el real en `search.n_iter`, y ese número termina en el
+reporte y en MLflow). De 250 fits se pasó a 550, ~2,2×, y la corrida completa tarda
+~15 s. `TRAIN_MODEL_FAMILIES=xgboost` reproduce exactamente el pipeline anterior.
+
+De paso se corrigió una subscripción excesiva de cores que ya existía con una sola
+familia: `RandomizedSearchCV(n_jobs=-1)` envolvía un `XGBRegressor(n_jobs=-1)`, así
+que los procesos de la validación cruzada competían entre sí por los mismos cores.
+Los estimadores del zoo se construyen con `n_jobs=1` y el paralelismo queda sólo en
+el nivel de CV.
+
+**El nombre del modelo registrado.** `MLFLOW_MODEL_NAME` pasó de
+`insurance-charges-xgb` a `insurance-charges-regressor`. El nombre de un registered
+model designa la **tarea**, no el algoritmo; con comparación entre familias, el
+nombre anterior pasa de inexacto a engañoso en cuanto gana otra. La familia de cada
+versión queda en su tag `model_family`. Las versiones ya registradas quedan bajo el
+nombre viejo: no estorban, porque `resolve_model()` cae al paso 3 de su cadena
+(mejor run de training) hasta que el nombre nuevo tenga su primer alias, y
+`MLFLOW_MODEL_NAME=insurance-charges-xgb` restituye la continuidad exacta.
+
+### 2.14.1 El modelo del README, registrado como línea de base
+
+**El problema.** El `README.md` del equipo de ciencia de datos publica un modelo con
+métricas concretas (R² = 0,8353 / RMSE = $4.835) y sus hiperparámetros ganadores. Pero
+ese modelo **no estaba en ningún lado**: el `.pkl` original nunca se versionó y el repo
+no traía artefactos. Era una afirmación en un documento, sin nada que la respaldara ni
+contra qué comparar.
+
+**La decisión.** `scripts/register_readme_baseline.py` lo reconstruye y lo registra
+**una sola vez**, para que la comparación *"lo que había"* vs *"lo que eligió el
+pipeline"* se pueda hacer dentro de MLflow y no leyendo dos documentos en paralelo.
+
+**Es una reproducción, no el artefacto original**, y el script lo dice en su docstring.
+Lo que sí se conserva del original, verificado contra el commit inicial
+(`git show decb3a1:src/training.py`):
+
+- los hiperparámetros exactos que publica el README
+- el mismo split: `test_size=0.2, random_state=43` — idéntico al `SPLIT_SEED` actual
+- las mismas semillas del estimador y de la búsqueda (42)
+- el mismo feature engineering y la misma transformación `log1p`
+
+Como el split y las semillas coinciden, la reproducción es determinística. **El script
+imprime la comparación contra lo que el README declara**, y si no coincidiera lo diría
+en vez de disimularlo. Coincide:
+
+| Métrica (validación) | README | Reproducido | Delta |
+|---|---:|---:|---:|
+| R² | 0,8353 | 0,8353 | +0,0000 |
+| RMSE | $4.835,00 | $4.834,74 | −0,26 |
+| MAE | $2.102,00 | $2.101,55 | −0,45 |
+| MAPE | 17,7000 | 17,7036 | +0,0036 |
+
+O sea que **el README decía la verdad**, con diferencias de centavos atribuibles al
+redondeo del propio documento.
+
+**El hallazgo incómodo, y su verificación.** La línea de base del README
+($4.834,74) le **gana** a la familia `xgboost` de nuestra comparación ($4.897,22). No
+es misterioso: el código original corría **350 iteraciones** de búsqueda —por el bug
+del typo (§ 3, hallazgo 3), que dejaba el default de 350 en vez de las 50 que se creía
+configurar— y nosotros corremos 50. Con menos búsqueda, XGBoost encuentra un óptimo
+peor.
+
+Eso pone en duda la conclusión de § 2.14: si XGBoost está sub-buscado, "gana Random
+Forest" podría ser un artefacto del presupuesto. **Se verificó**, corriendo la familia
+`xgboost` con las 350 iteraciones del original:
+
+| Configuración | val_RMSE | val_R² |
+|---|---:|---:|
+| `xgboost`, 50 iteraciones (default) | $4.897,22 | 0,8310 |
+| `xgboost`, 350 iteraciones (el original) | $4.834,74 | 0,8353 |
+| **`random_forest`, 20 iteraciones (ganador)** | **$4.800,25** | **0,8377** |
+
+Con 350 iteraciones, XGBoost reproduce exactamente la línea de base del README — lo
+que confirma de paso que esa línea de base es fiel— y **sigue perdiendo**. La
+conclusión se sostiene incluso dándole al incumbente siete veces más presupuesto que
+al ganador.
+
+Dos cosas quedan dichas y no barridas: con el presupuesto por defecto, la familia
+`xgboost` del reporte rinde peor que el modelo con el que arrancó el proyecto; y no se
+hizo un barrido de presupuesto para las cuatro familias, sólo para la que tenía motivos
+para sospecharse perjudicada.
+
+**Por qué en un registro aparte.** Queda como `insurance-charges-baseline-ds` con alias
+`reference`, no como una versión del modelo que sirve en producción. Es una referencia
+histórica, no un candidato: si viviera en la misma cadena de versiones daría a entender
+que compite por el alias `production`, y no compite. Por la misma razón su run lleva
+`pipeline_stage=baseline` y no `training`, así que `resolve_model()` no puede
+resolverlo por accidente.
+
+### 2.15 Umbrales de monitoreo por feature y por lote
+
+**El problema.** `PSI_WARN` / `PSI_ALERT` se aplicaban igual a `bmi` —la feature de
+mayor peso, que además entra tres veces vía `bmi_squared` y `bmi_smoker`— que a
+`region`, una categórica de cuatro niveles casi uniformes cuyo PSI oscila por
+muestreo. Y `prod3`, que llega sin ground truth y con las features corruptas, se
+medía con la misma vara que `prod1`, que está sano. El resultado es un semáforo a
+la vez ruidoso en unas señales y permisivo en otras.
+
+**La decisión.** Un archivo de reglas, `config/monitoring_rules.json`, con cuatro
+niveles de precedencia:
+
+```
+regla de (lote, feature)  >  regla de lote  >  regla de feature  >  default global
+```
+
+**Por qué "lote" le gana a "feature"**, que es el único choque no obvio: una regla
+de lote es una afirmación deliberada sobre un dataset concreto, tomada por alguien
+que conoce ese dataset; una de feature es un refinamiento que vale para todos.
+Cuando las dos aplican y hay que ser explícito, la forma inequívoca de resolverlo
+es escribir la regla de `(lote, feature)` — y el archivo que se entrega usa
+exactamente ese mecanismo para `prod3` + `sex` / `region`.
+
+**Por qué un archivo y no más variables de entorno.** La alternativa era
+`PSI_WARN_BMI`, `PSI_ALERT_BMI`, `PSI_WARN_REGION`… una variable por feature y por
+umbral. Con 6 features y 5 pares de umbrales eso son 60 variables, y ninguna
+combinación por lote sería expresable.
+
+**Compatibilidad.** Sin archivo, `resolve_thresholds()` devuelve el default global y
+el comportamiento es idéntico al de antes de que existieran las reglas — es el caso
+normal, no una excepción. Un archivo presente pero mal formado devuelve los
+defaults con un WARNING: un JSON roto no debe tumbar un pipeline de scoring que por
+lo demás puede correr perfectamente.
+
+**Auditabilidad, y por qué es por grupo de umbral.** Cada `Signal` lleva un campo
+`thresholds_source` con la regla que fijó **el umbral que decidió esa señal**, no un
+resumen de todas las que aplicaron. La distinción importa: una regla de feature puede
+fijar los PSI y una de lote el umbral de esquema, y entonces la señal de drift y la de
+contrato están gobernadas por reglas distintas aunque las dos aplicaron al mismo lote.
+Por eso `Thresholds` guarda la procedencia por grupo (`psi`, `perf`, `r2`,
+`target_shift`, `schema`) y cada evaluador estampa la del suyo. El reporte imprime esa
+regla junto a la señal y en el pie. Sin eso, un `WARNING`
+emitido con un umbral custom sería indistinguible de uno emitido con el global, y
+el reporte dejaría de ser verificable. Por la misma razón, `evaluate_schema()`
+**recalcula** la severidad con los umbrales del lote en vez de confiar en la que
+trae `data_loader`: ese módulo resuelve la suya con los globales porque no sabe a
+qué lote pertenece el archivo que está leyendo.
+
+### 2.16 El monitoreo tiene memoria: alertas con estado
+
+**El problema.** `batch_monitoring` guarda una fila por lote por corrida. Eso
+responde *cómo está el lote hoy*, pero no las dos preguntas que hacen accionable a
+una alerta: **¿esto es nuevo?** y **¿lo que estaba mal se arregló?**. Un reporte que
+dice exactamente lo mismo en cada corrida es un informe, no un sistema de alertas:
+quien lo recibe deja de leerlo.
+
+**La decisión.** Una tabla `alert_history` donde la identidad de una alerta es la
+tupla `(batch_id, signal_name)`, con tres transiciones: `NEW`, `ONGOING`,
+`RESOLVED`. Una señal en OK que no tenía alerta abierta **no registra nada**: el
+historial guarda problemas, no el estado completo de cada corrida.
+
+**La deduplicación es el punto.** `NEW` es el único evento notificable. Una alerta
+que lleva cinco corridas abierta aparece una vez como `ONGOING` con
+`occurrences=5`, no como cinco alertas. Un cambio de severidad (`WARNING` →
+`ALERT`) se anota en `severity_history` y **no** abre una alerta nueva: sigue siendo
+el mismo problema, y tratarlo como nuevo volvería a notificar algo que ya se sabía.
+
+**El invariante lo impone la base, no el código:**
+
+```sql
+CREATE UNIQUE INDEX idx_alert_open
+    ON alert_history (batch_id, signal_name) WHERE state = 'open';
+```
+
+Un índice único parcial sobre `state='open'`. La deduplicación no queda dependiendo
+de que `reconcile()` se acuerde de respetarla.
+
+**Una alerta resuelta que reaparece vuelve a ser `NEW`**, y es correcto: las
+resueltas no figuran entre las abiertas, y un problema que vuelve después de
+haberse arreglado sí amerita notificarse otra vez.
+
+**Escalamiento vs. baja de severidad.** Un `ALERT` que baja a `WARNING` no es un
+escalamiento, y rotular ambos casos igual confundiría a quien lee el reporte. La
+dirección del cambio se calcula con `config.STATUS_ORDER` y se imprime como
+`ESCALADA` o `BAJO`.
+
+**Un fallo de la base no aborta el scoring.** `reconcile()` loguea un WARNING y
+devuelve vacío. Es el mismo criterio que `mlflow_utils.log_artifact_safe`: el historial
+de alertas es valioso, pero las predicciones ya están escritas y el reporte ya se
+puede generar; perder un scoring completo por no poder actualizar el historial sería
+desproporcionado.
+
+**Lo que NO se hizo, a propósito:** no hay canal de notificación (webhook, Slack,
+mail) ni scheduler. El diseño los deja a un paso — un notificador es un consumidor
+de las transiciones `NEW`, que es exactamente el evento notificable — pero
+agregarlos sin un destinatario real sería infraestructura sin uso, que es el mismo
+error que se evitó con Docker (§ 5).
 
 ### 2.6 El drift se mide sobre las features crudas, no sobre las derivadas
 
@@ -381,17 +676,17 @@ el mismo resultado con `is_training=True` y `False`.
 
 | # | Ubicación | Problema | Impacto | Estado |
 |---|-----------|----------|---------|--------|
-| 1 | `.gitignore` | La regla `*.txt` ignoraba `requirements.txt`, que directamente **no existía en el repo**, aunque el `Dockerfile` hace `COPY requirements.txt .` | **El build de Docker fallaba.** Bloqueante | Corregido: archivo creado + negaciones en `.gitignore` |
+| 1 | `.gitignore` | La regla `*.txt` ignoraba `requirements.txt`, que directamente **no existía en el repo**, aunque el `Dockerfile` original hacía `COPY requirements.txt .` | **El build de Docker fallaba**, y sin el archivo tampoco había forma de reproducir el entorno local. Bloqueante | Corregido: archivo creado + negaciones en `.gitignore` |
 | 2 | `.gitignore` | `*.json`, `*.txt`, `*.pkl` globales sin excepciones | Ignoraba reportes, metadata y documentación | Corregido con negaciones explícitas |
-| 3 | `training.py:153` | `os.getenv('HIPERPARAM_ITERATIONS', 350)` — typo; `docker-compose` exporta `HYPERPARAM_ITERATIONS` | La variable **nunca tenía efecto**: se entrenaba siempre con 350 iteraciones × 5 folds = 1.750 fits en vez de 50. Reproducibilidad rota | Corregido en `config.py`, aceptando el nombre viejo como respaldo |
+| 3 | `training.py:153` | `os.getenv('HIPERPARAM_ITERATIONS', 350)` — typo; el entorno del proyecto exportaba `HYPERPARAM_ITERATIONS` | La variable **nunca tenía efecto**: se entrenaba siempre con 350 iteraciones × 5 folds = 1.750 fits en vez de 50. Reproducibilidad rota | Corregido en `config.py`, aceptando el nombre viejo como respaldo |
 | 4 | `scoring.py:82` | `actual_charges = df['charges'].values` sin guarda | **Reventaba con `prod3`**, que no tiene target | Corregido: el target es opcional en todo el flujo |
 | 5 | `training.py:213` | `mape_log` se calculaba con los valores en escala original | Duplicaba el MAPE en dólares bajo otro nombre | Corregido |
 | 6 | `training.py:224-225` | `adj_r2` usaba `p = X_train.shape[1]`, las features **antes** del `ColumnTransformer` | R² ajustado mal calculado: ignoraba las dummies del one-hot | Corregido usando `get_feature_names_out()` |
 | 7 | `training.py:419-421` | "Paso 5 beta" llamaba a `create_preprocessor()` y `define_hyperparameter_grid()` y descartaba el resultado | Trabajo muerto | Eliminado |
 | 8 | `README.md:139` | Indica `cp .env.example .env`, pero el archivo se llama `.env.template` (`.env.example` nunca existió en el repo) | Instrucción de setup rota | **No corregido ahí**: el README original no se modifica (ver § 6). La instrucción correcta está en `SOLUTION.md` |
-| 9 | `docker-compose.yaml` | Sin volúmenes para MLflow ni para `./data` | Los experimentos se perderían al bajar el contenedor | Corregido |
+| 9 | `docker-compose.yaml` | Sin volúmenes para MLflow ni para `./data` | Los experimentos se perderían al bajar el contenedor | **Sin efecto**: el archivo se eliminó (ver § 5). Queda como hallazgo sobre el repo original |
 | 10 | `training.py:312` | El log decía "Symlink actualizado" pero el código usa `shutil.copy2` | Mensaje engañoso | Corregido |
-| 11 | `docker-compose.yaml` | `restart: on-failure` en un job por lotes | Un pipeline que falla se reintentaría en loop | Cambiado a `restart: "no"` |
+| 11 | `docker-compose.yaml` | `restart: on-failure` en un job por lotes | Un pipeline que falla se reintentaría en loop | **Sin efecto**: el archivo se eliminó (ver § 5). Queda como hallazgo sobre el repo original |
 
 ---
 
@@ -411,28 +706,64 @@ el mismo resultado con `is_training=True` y `False`.
    sobre el RMSE de validación) son una elección conservadora. Todos son
    configurables por variable de entorno, que es lo que permite ajustarlos
    cuando haya historia real.
-5. **El modelo no se toca.** El challenge es de MLOps: se conservan el XGBoost,
-   el grid de búsqueda, la transformación `log1p` y el feature engineering
-   originales. Las métricas obtenidas (R² = 0,8310, RMSE = $4.897) están en línea
-   con las documentadas en el README original (0,8353 / $4.835); la diferencia
-   se explica por la cantidad de iteraciones de la búsqueda aleatoria.
+5. **El pipeline de XGBoost no se toca; se le agregan competidores.** El challenge
+   es de MLOps, así que se conservan intactos el grid de búsqueda, la
+   transformación `log1p` y el feature engineering originales. Las métricas de la
+   familia `xgboost` (R² = 0,8310, RMSE = $4.897) están en línea con las
+   documentadas en el README original (0,8353 / $4.835); la diferencia se explica
+   por la cantidad de iteraciones de la búsqueda aleatoria. Lo que sí se agregó
+   son tres familias más para medirlo contra algo (§ 2.14): el enunciado pide un
+   criterio de "mejor modelo", y un criterio que se aplica a un solo candidato no
+   está eligiendo nada.
 6. **Python 3.11.** El proyecto original apuntaba a 3.10; se subió a 3.11 porque
    MLflow 3.x requiere ≥ 3.10 y 3.11 es la versión con soporte más estable hoy.
-   `Dockerfile` y entorno local usan la misma versión.
 
 ---
 
-## 5. Qué quedó sin verificar
+## 5. Docker: eliminado, no adaptado
 
-**El flujo con Docker está escrito pero no fue ejecutado**, porque la máquina de
-desarrollo no tiene Docker instalado. El `Dockerfile`, el `docker-compose.yaml` y
-el `entrypoint.sh` están actualizados y son coherentes con el pipeline local
-(mismas variables de entorno, mismos pasos, mismos volúmenes), y el
-`requirements.txt` que faltaba —y que hacía fallar el build— ya existe. Pero la
-verificación end-to-end se hizo **en local**: venv con Python 3.11 y PostgreSQL 17
-en `localhost`.
+**Decisión:** se eliminaron del repositorio el `Dockerfile`, el
+`docker-compose.yaml`, el `entrypoint.sh` y el `scripts/init-mlflow-db.sql`
+(que sólo existía para inicializar la base de MLflow dentro del contenedor). El
+proyecto se entrega para ejecución local, documentada en `SOLUTION.md`.
 
-`SOLUTION.md` marca explícitamente qué parte está verificada y cuál no.
+**Tensión con el enunciado.** Los requisitos técnicos piden *"mantener
+compatibilidad con la ejecución actual del proyecto (incluyendo Docker si ya
+está configurado)"*, y el repo original **sí** lo tenía configurado. Esta es una
+desviación deliberada y el motivo es el siguiente.
+
+**Por qué.** La máquina de desarrollo no tiene Docker instalado, así que el
+flujo containerizado **nunca se ejecutó**. Mantenerlo obligaba a elegir entre
+dos malas opciones:
+
+1. **Entregarlo sin verificar.** El pipeline cambió mucho —backend PostgreSQL
+   para MLflow, una segunda base, un paso nuevo de promoción, volúmenes para
+   artefactos—, y la adaptación de los tres archivos se hizo *a ojo*. Ya había
+   aparecido al menos una divergencia real respecto del flujo local: el
+   `docker-compose.yaml` seguía partiendo los runs en dos experimentos
+   (`insurance-charges-training` / `-scoring`) después de que la solución los
+   unificara en uno solo (§ 2.13). Todo lo que `SOLUTION.md` promete sobre
+   comparar validación y producción en un mismo gráfico **no se cumplía** dentro
+   del contenedor. Una infraestructura que no se corrió no es una garantía de
+   reproducibilidad: es una afirmación sin respaldo, y si falla en la máquina de
+   quien evalúa, es peor que su ausencia.
+2. **Instalar Docker y verificarlo.** Fuera del alcance de este challenge.
+
+**Qué se pierde y cómo se compensa.** Lo único que aportaba el contenedor era
+levantar PostgreSQL y ejecutar cinco comandos en orden. Lo primero son dos
+`createdb`; lo segundo son los cinco comandos que `SOLUTION.md` lista
+explícitamente, en el mismo orden en que los encadenaba el `entrypoint.sh`:
+
+```
+pytest → db_setup → training → promote_model → scoring
+```
+
+El proyecto no depende de Docker en ningún punto: toda la configuración se lee
+de variables de entorno (`src/config.py`), así que containerizarlo de nuevo es
+directo para quien tenga con qué probarlo.
+
+**Lo que sí está verificado:** el pipeline completo corre end-to-end en local,
+con venv de Python 3.11 y PostgreSQL 17 en `localhost`.
 
 ---
 

@@ -79,24 +79,99 @@ def get_client() -> MlflowClient:
 # Logging de artefactos
 # ============================================================================
 
-def log_json_artifact(obj: Dict[str, Any], filename: str) -> None:
-    """Sube un dict como artefacto JSON del run activo."""
-    mlflow.log_dict(obj, filename)
+def log_artifact_safe(path, artifact_path: str = None) -> bool:
+    """Sube un artefacto al run activo sin abortar el pipeline si falla.
 
+    El modelo y las metricas se loguean antes que los artefactos accesorios
+    (reporte, cv_results, grafico de importancia). Sin esta guarda, un disco
+    lleno o un permiso mal puesto sobre el artifact store tira una excepcion que
+    se propaga hasta el `except` de `main()` y se pierde un entrenamiento de
+    varios minutos que en realidad ya habia terminado bien.
 
-def log_text_artifact(text: str, filename: str) -> None:
-    mlflow.log_text(text, filename)
+    El criterio: un artefacto accesorio que no se pudo subir es un WARNING, no
+    un fallo del pipeline. Lo que SI debe abortar es que falle el modelo o las
+    metricas, y eso sigue sin guarda a proposito.
+
+    Devuelve True solo si el artefacto quedo subido.
+    """
+    if path is None:
+        return False
+
+    path = Path(path)
+    if not path.exists():
+        logger.warning("Artefacto inexistente, no se sube: %s", path)
+        return False
+
+    try:
+        mlflow.log_artifact(str(path), artifact_path=artifact_path)
+        return True
+    except Exception as exc:
+        logger.warning("No se pudo subir el artefacto %s: %s", path.name, exc)
+        return False
 
 
 # ============================================================================
 # Model Registry
 # ============================================================================
 
+def _metric_fingerprint(metrics: Dict[str, float], family: str = None) -> Dict[str, str]:
+    """Huella comparable de un modelo: sus metricas formateadas, mas la familia.
+
+    Se formatea con la MISMA precision con la que se guardan los tags de la version
+    (6 decimales), para que comparar la huella de un candidato contra la de una
+    version ya registrada sea exacto y no dependa de ruido de punto flotante.
+    """
+    fingerprint = {f"metric.{k}": f"{v:.6f}" for k, v in metrics.items()}
+    fingerprint["model_family"] = family or "n/d"
+    return fingerprint
+
+
+def _latest_version(client, model_name: str):
+    """Ultima version registrada del modelo, o None si todavia no hay ninguna."""
+    try:
+        versions = client.search_model_versions(f"name='{model_name}'")
+    except MlflowException:
+        return None
+    return max(versions, key=lambda v: int(v.version)) if versions else None
+
+
+def find_duplicate_version(metrics: Dict[str, float], family: str = None,
+                           model_name: str = None):
+    """Devuelve la ultima version si es indistinguible del candidato, o None.
+
+    "Indistinguible" significa: misma familia y mismas metricas de seleccion. Es
+    deliberadamente una comparacion de RESULTADOS, no del artefacto: dos entrenamientos
+    con la misma semilla y los mismos datos producen el mismo modelo, y registrar el
+    segundo no agrega informacion.
+
+    Limitacion que hay que tener presente: si cambia el codigo pero las metricas no se
+    mueven, el cambio no se detecta y la version no se registra. El run igual queda
+    trazado entero en MLflow con sus artefactos; lo unico que se saltea es la entrada en
+    el Registry. Por eso el comportamiento es configurable con REGISTER_SKIP_DUPLICATES.
+    """
+    model_name = model_name or config.MLFLOW_MODEL_NAME
+    latest = _latest_version(_client_or_none(), model_name)
+    if latest is None:
+        return None
+
+    candidate = _metric_fingerprint(metrics, family)
+    previous = {key: latest.tags.get(key) for key in candidate}
+    return latest if previous == candidate else None
+
+
+def _client_or_none():
+    try:
+        return get_client()
+    except Exception:  # pragma: no cover - el backend ya se valido en setup_tracking
+        return MlflowClient()
+
+
 def register_model_version(
     run_id: str,
     metrics: Dict[str, float],
     model_artifact: str = None,
     model_name: str = None,
+    family: str = None,
 ) -> Optional[Any]:
     """Registra el modelo del run como una nueva version y la deja en `staging`.
 
@@ -109,10 +184,30 @@ def register_model_version(
     model_artifact = model_artifact or config.MLFLOW_MODEL_ARTIFACT
     client = get_client()
 
+    # Gate de deduplicacion: una version cuyas metricas y familia son identicas a las
+    # de la ultima registrada no aporta nada. Se devuelve la que ya existe, y quien
+    # llama distingue el caso comparando `version.run_id` contra el run que acaba de
+    # entrenar.
+    if config.REGISTER_SKIP_DUPLICATES:
+        duplicate = find_duplicate_version(metrics, family, model_name)
+        if duplicate is not None:
+            logger.warning(
+                "No se registra una version nueva: %s v%s ya tiene estas metricas "
+                "(familia=%s, %s). Reentrenar con la misma semilla y los mismos datos "
+                "produce el mismo modelo. Para registrar igual: REGISTER_SKIP_DUPLICATES=false",
+                model_name, duplicate.version, family or "n/d",
+                ", ".join(f"{k}={v:,.4f}" for k, v in sorted(metrics.items())),
+            )
+            return duplicate
+
     try:
         client.create_registered_model(
             model_name,
-            description="Predictor de costos de seguro medico (XGBoost + target log1p).",
+            description=(
+                "Predictor de costos de seguro medico (target log1p). La familia de "
+                "modelo se elige por comparacion en cada entrenamiento y queda en el "
+                "tag `model_family` de cada version."
+            ),
         )
         logger.info("Modelo registrado creado: %s", model_name)
     except MlflowException:
@@ -126,13 +221,17 @@ def register_model_version(
 
     client.set_model_version_tag(model_name, version.version, "stage", "Staging")
     client.set_model_version_tag(model_name, version.version, "selection_metric", config.MODEL_SELECTION_METRIC)
+    # La familia va como tag de la VERSION para que el registry conteste "que modelo
+    # esta sirviendo hoy" sin tener que abrir el run que lo produjo.
+    if family:
+        client.set_model_version_tag(model_name, version.version, "model_family", family)
     for key, value in metrics.items():
         client.set_model_version_tag(model_name, version.version, f"metric.{key}", f"{value:.6f}")
 
     client.set_registered_model_alias(model_name, config.ALIAS_STAGING, version.version)
 
-    logger.info("Modelo registrado: %s v%s -> alias '%s'",
-                model_name, version.version, config.ALIAS_STAGING)
+    logger.info("Modelo registrado: %s v%s (familia: %s) -> alias '%s'",
+                model_name, version.version, family or "n/d", config.ALIAS_STAGING)
     return version
 
 

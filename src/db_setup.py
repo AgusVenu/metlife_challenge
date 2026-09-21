@@ -29,8 +29,8 @@ def drop_tables(engine):
     """Elimina las tablas para arrancar de cero."""
     logger.info("Eliminando tablas existentes (si existen)...")
     with engine.connect() as conn:
-        for table in ("batch_monitoring", "batch_predictions", "predictions",
-                      "scoring_dataset", "training_dataset"):
+        for table in ("alert_history", "batch_monitoring", "batch_predictions",
+                      "predictions", "scoring_dataset", "training_dataset"):
             conn.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE;"))
         conn.commit()
     logger.info("Tablas eliminadas.")
@@ -123,6 +123,37 @@ def create_tables(engine):
                 details JSONB
             )
         """,
+        # Estado de las alertas a traves del tiempo, no un log mas.
+        #
+        # `batch_monitoring` guarda una fila por lote por corrida: sirve para saber
+        # como esta el lote HOY, pero no para responder "esto es nuevo?" ni "cuanto
+        # hace que esta roto?". La identidad de una alerta es (batch_id, signal_name),
+        # y sobre esa clave hay tres transiciones: NEW / ONGOING / RESOLVED.
+        #
+        # El indice unico PARCIAL sobre state='open' es lo que garantiza en la BASE
+        # que no puede haber dos alertas abiertas para la misma senal. La
+        # deduplicacion no queda dependiendo de que el codigo se acuerde de respetarla.
+        "alert_history": """
+            CREATE TABLE IF NOT EXISTS alert_history (
+                id SERIAL PRIMARY KEY,
+                batch_id VARCHAR(50) NOT NULL,
+                signal_name VARCHAR(120) NOT NULL,
+                category VARCHAR(30) NOT NULL,
+                severity VARCHAR(10) NOT NULL,
+                state VARCHAR(10) NOT NULL,
+                first_seen TIMESTAMP NOT NULL,
+                last_seen TIMESTAMP NOT NULL,
+                resolved_at TIMESTAMP,
+                occurrences INTEGER NOT NULL DEFAULT 1,
+                last_value DOUBLE PRECISION,
+                last_detail TEXT,
+                thresholds_source VARCHAR(60),
+                model_name VARCHAR(100),
+                model_version VARCHAR(20),
+                mlflow_run_id VARCHAR(64),
+                severity_history JSONB
+            )
+        """,
     }
 
     with engine.connect() as conn:
@@ -136,6 +167,16 @@ def create_tables(engine):
         conn.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_batch_monitoring_batch "
             "ON batch_monitoring (batch_id, scored_at)"
+        ))
+        # Una sola alerta abierta por (lote, senal). Es la deduplicacion, impuesta por
+        # la base y no por el codigo.
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_open "
+            "ON alert_history (batch_id, signal_name) WHERE state = 'open'"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_alert_batch "
+            "ON alert_history (batch_id, last_seen)"
         ))
         conn.commit()
 

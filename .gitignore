@@ -226,8 +226,8 @@ mlartifacts/
 # Excepciones: archivos que SI deben versionarse
 # ----------------------------------------------------------------------------
 # Las reglas *.txt / *.json de arriba son demasiado amplias y llegaban a
-# ignorar requirements.txt, lo que rompia `COPY requirements.txt .` en el
-# Dockerfile. Estas negaciones lo corrigen.
+# ignorar requirements.txt, que por eso no existia en el repo original.
+# Estas negaciones lo corrigen.
 # ============================================================================
 !requirements.txt
 !README.md
@@ -236,5 +236,8 @@ mlartifacts/
 !SOLUTION.md
 !data/README.md
 !.env.template
+# Reglas de monitoreo: son configuracion del proyecto, no una salida del pipeline.
+!config/
+!config/*.json
 
 *.DS_Store

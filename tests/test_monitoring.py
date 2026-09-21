@@ -233,7 +233,7 @@ def test_el_reporte_de_texto_incluye_a_todos_los_lotes(baseline, healthy_batch):
     assert "prod1" in text and "prod3" in text
     assert "REPORTE DE MONITOREO" in text
     assert "no trae ground truth" in text          # prod3 no tiene performance
-    assert "Umbrales aplicados" in text
+    assert "Umbrales por defecto" in text
 
 
 def test_to_dataframe_da_una_fila_por_lote(baseline, healthy_batch):

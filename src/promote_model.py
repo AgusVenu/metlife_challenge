@@ -168,16 +168,25 @@ def main(argv=None):
         logger.info("=" * 70)
         logger.info("EVALUACION DE PROMOCION - %s", config.MLFLOW_MODEL_NAME)
         logger.info("=" * 70)
-        logger.info("Candidato:   v%s (run %s)", candidate.version, candidate.run_id)
+        # La familia es informativa, no un gate: se promueve por metrica, no por
+        # algoritmo. Pero sin ella el log no dice QUE se esta reemplazando.
+        candidate_family = (candidate.tags or {}).get("model_family", "n/d")
+        production_family = (production.tags or {}).get("model_family", "n/d") if production else None
+
+        logger.info("Candidato:   v%s (run %s) - familia: %s",
+                    candidate.version, candidate.run_id, candidate_family)
         logger.info("  val_rmse=%s  val_r2=%s  overfitting=%s",
                     _fmt(candidate_metrics.get("val_rmse")),
                     _fmt(candidate_metrics.get("val_r2"), 4),
                     _fmt(candidate_metrics.get("overfitting_r2_diff"), 4))
         if production is not None:
-            logger.info("Produccion:  v%s (run %s)", production.version, production.run_id)
+            logger.info("Produccion:  v%s (run %s) - familia: %s",
+                        production.version, production.run_id, production_family)
             logger.info("  val_rmse=%s  val_r2=%s",
                         _fmt(production_metrics.get("val_rmse")),
                         _fmt(production_metrics.get("val_r2"), 4))
+            if candidate_family != production_family:
+                logger.info("  Cambio de familia: %s -> %s", production_family, candidate_family)
         else:
             logger.info("Produccion:  (ninguna version promovida todavia)")
 

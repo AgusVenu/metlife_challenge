@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
+import alerts
 import config
 import dashboard
 import data_loader
@@ -242,6 +243,13 @@ def score_batch(batch, model, baseline, model_info, engine, timestamp):
         save_predictions_db(engine, results)
         save_monitoring_db(engine, report)
 
+        # Estado de las alertas: que es nuevo, que sigue abierto y que se resolvio
+        # respecto de la corrida anterior de este mismo lote.
+        transitions = alerts.reconcile(
+            engine, report, {**model_info, "scoring_run_id": run.info.run_id}
+        )
+        alert_counts = alerts.summarize(transitions)
+
         # --- MLflow ---
         mlflow.log_params({
             "batch_id": batch.batch_id,
@@ -258,6 +266,11 @@ def score_batch(batch, model, baseline, model_info, engine, timestamp):
         metrics_to_log = {
             "psi_max": report.psi_max,
             "n_violations": len(report.violations),
+            # Graficables junto a rmse y psi_* en la UI: permite ver la correlacion
+            # entre el drift y las alertas a lo largo de las corridas.
+            "alerts_new": alert_counts["new"],
+            "alerts_ongoing": alert_counts["ongoing"],
+            "alerts_resolved": alert_counts["resolved"],
             "pred_mean": report.prediction_summary.get("mean", float("nan")),
             "pred_std": report.prediction_summary.get("std", float("nan")),
         }
@@ -275,14 +288,23 @@ def score_batch(batch, model, baseline, model_info, engine, timestamp):
             "batch_id": batch.batch_id,
             "monitoring_status": report.status,
             "has_target": str(loaded.has_target),
+            # Lo unico que amerita que alguien mire este run: que haya algo que no se
+            # supiera en la corrida anterior.
+            "has_new_alerts": str(bool(alert_counts["new"])).lower(),
         })
         mlflow.log_dict(report.to_dict(), f"monitoring_{batch.batch_id}.json")
-        mlflow.log_artifact(str(csv_path), artifact_path="predictions")
+        mlflow.log_dict({"transitions": [t.to_dict() for t in transitions]},
+                        f"alerts_{batch.batch_id}.json")
+        mlflow_utils.log_artifact_safe(csv_path, artifact_path="predictions")
 
         logger.info("  ESTADO: %s", report.status)
+        logger.info("  Alertas: %d nuevas | %d persisten | %d resueltas",
+                    alert_counts["new"], alert_counts["ongoing"], alert_counts["resolved"])
+        for line in alerts.render_alerts_section(transitions, indent="    "):
+            logger.info("%s", line)
         logger.info("  %s", report.diagnosis)
 
-    return report
+    return report, transitions
 
 
 # ============================================================================
@@ -329,15 +351,20 @@ def run_sample_scoring(model, engine, model_info) -> bool:
 # Modo produccion
 # ============================================================================
 
-def run_prod_scoring(model, baseline, model_info, engine, timestamp) -> List[monitoring.BatchReport]:
+def run_prod_scoring(model, baseline, model_info, engine, timestamp):
+    """Puntua todos los lotes. Devuelve (reportes, transiciones_de_alerta_por_lote)."""
     batches = data_loader.discover_batches()
     logger.info("Lotes descubiertos en %s: %s",
                 config.PROD_DATA_DIR, ", ".join(str(b) for b in batches))
 
-    reports = []
+    reports, transitions_by_batch = [], {}
     for batch in batches:
         try:
-            reports.append(score_batch(batch, model, baseline, model_info, engine, timestamp))
+            report, transitions = score_batch(
+                batch, model, baseline, model_info, engine, timestamp
+            )
+            reports.append(report)
+            transitions_by_batch[batch.batch_id] = transitions
         except Exception as exc:
             # Que un lote falle no debe abortar el resto: se registra como ALERT
             # y el pipeline sigue con los demas.
@@ -350,14 +377,19 @@ def run_prod_scoring(model, baseline, model_info, engine, timestamp) -> List[mon
                 model_info=model_info,
             )
             reports.append(failed)
-    return reports
+            # None, no []: el lote no llego a reconciliarse, asi que NO se sabe que
+            # cambio. Una lista vacia significaria "sin cambios respecto de la corrida
+            # anterior", que es justo lo que no se puede afirmar de un lote que
+            # exploto. Sus alertas previas siguen abiertas, como corresponde.
+            transitions_by_batch[batch.batch_id] = None
+    return reports, transitions_by_batch
 
 
-def write_reports(reports, model_info, timestamp) -> Dict[str, Path]:
+def write_reports(reports, model_info, timestamp, transitions_by_batch=None) -> Dict[str, Path]:
     """Genera el reporte consolidado en JSON, CSV, TXT y HTML."""
     results_dir = Path(config.RESULTS_DIR)
     results_dir.mkdir(parents=True, exist_ok=True)
-    consolidated = monitoring.consolidate(reports, model_info)
+    consolidated = monitoring.consolidate(reports, model_info, transitions_by_batch)
 
     paths = {
         "json": results_dir / f"monitoring_report_{timestamp}.json",
@@ -367,7 +399,7 @@ def write_reports(reports, model_info, timestamp) -> Dict[str, Path]:
     }
 
     paths["json"].write_text(json.dumps(consolidated, indent=2), encoding="utf-8")
-    monitoring.to_dataframe(reports).to_csv(paths["csv"], index=False)
+    monitoring.to_dataframe(reports, transitions_by_batch).to_csv(paths["csv"], index=False)
     text_report = monitoring.render_text_report(consolidated)
     paths["txt"].write_text(text_report, encoding="utf-8")
     dashboard.write_dashboard(consolidated, paths["html"])
@@ -407,29 +439,43 @@ def main() -> bool:
                 "prod_data_dir": str(config.PROD_DATA_DIR),
             })
 
-            reports = run_prod_scoring(resolved.model, baseline, model_info, engine, timestamp)
-            paths, consolidated, text_report = write_reports(reports, model_info, timestamp)
+            reports, transitions_by_batch = run_prod_scoring(
+                resolved.model, baseline, model_info, engine, timestamp
+            )
+            paths, consolidated, text_report = write_reports(
+                reports, model_info, timestamp, transitions_by_batch
+            )
 
+            alert_totals = alerts.summarize_many(transitions_by_batch)
             mlflow.log_metrics({
                 "n_batches": len(reports),
                 "n_ok": consolidated["status_counts"]["OK"],
                 "n_warning": consolidated["status_counts"]["WARNING"],
                 "n_alert": consolidated["status_counts"]["ALERT"],
+                "alerts_new": alert_totals["new"],
+                "alerts_ongoing": alert_totals["ongoing"],
+                "alerts_resolved": alert_totals["resolved"],
             })
-            mlflow.set_tag("overall_status", consolidated["overall_status"])
+            mlflow.set_tags({
+                "overall_status": consolidated["overall_status"],
+                "has_new_alerts": str(bool(alert_totals["new"])).lower(),
+            })
             mlflow.log_dict(consolidated, "monitoring_report.json")
             for path in paths.values():
-                mlflow.log_artifact(str(path), artifact_path="monitoring")
+                mlflow_utils.log_artifact_safe(path, artifact_path="monitoring")
 
         print("\n" + text_report + "\n")
 
         logger.info("=" * 70)
         logger.info("SCORING COMPLETADO - estado global: %s", consolidated["overall_status"])
+        logger.info("  Alertas: %d nuevas | %d persisten | %d resueltas",
+                    alert_totals["new"], alert_totals["ongoing"], alert_totals["resolved"])
         logger.info("=" * 70)
         for name, path in paths.items():
             logger.info("  %-5s -> %s", name, path)
         logger.info("  Predicciones por lote -> %s", config.PREDICTIONS_DIR)
-        logger.info("  Tablas: batch_predictions, batch_monitoring")
+        logger.info("  Tablas: batch_predictions, batch_monitoring, alert_history")
+        logger.info("  Historial de alertas:  python src/alerts.py [--batch X] [--history]")
         logger.info("")
         logger.info("  Ver los runs:  %s", config.mlflow_ui_command())
 

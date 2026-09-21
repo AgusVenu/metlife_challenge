@@ -225,10 +225,12 @@ def psi_categorical(reference_freqs: Dict[str, float], values) -> float:
     return psi_from_freqs(ref, act)
 
 
-def psi_status(psi_value: float) -> str:
-    if psi_value > config.PSI_ALERT:
+def psi_status(psi_value: float, thresholds=None) -> str:
+    """Traduce un PSI a estado. Sin `thresholds`, usa los umbrales globales."""
+    thresholds = thresholds or config.DEFAULT_THRESHOLDS
+    if psi_value > thresholds.psi_alert:
         return config.STATUS_ALERT
-    if psi_value > config.PSI_WARN:
+    if psi_value > thresholds.psi_warn:
         return config.STATUS_WARNING
     return config.STATUS_OK
 
@@ -329,11 +331,16 @@ class Signal:
     value: Optional[float]
     status: str
     detail: str
+    # De donde salieron los umbrales con los que se decidio este estado. Sin este dato
+    # un WARNING emitido con una regla custom es indistinguible de uno emitido con el
+    # umbral global, y el reporte deja de ser auditable.
+    thresholds_source: str = "default"
 
     def to_dict(self) -> dict:
         return {
             "name": self.name, "category": self.category,
             "value": self.value, "status": self.status, "detail": self.detail,
+            "thresholds_source": self.thresholds_source,
         }
 
 
@@ -352,6 +359,7 @@ class BatchReport:
     violations: List[dict] = field(default_factory=list)
     prediction_summary: Dict[str, float] = field(default_factory=dict)
     model_info: Dict[str, Any] = field(default_factory=dict)
+    thresholds: Dict[str, Any] = field(default_factory=dict)
     scored_at: str = ""
 
     def signals_by_category(self, category: str) -> List[Signal]:
@@ -380,93 +388,148 @@ class BatchReport:
             "psi_max": self.psi_max,
             "psi_max_feature": self.psi_max_feature,
             "prediction_summary": self.prediction_summary,
+            "thresholds": self.thresholds,
             "signals": [s.to_dict() for s in self.signals],
             "violations": self.violations,
         })
+
+    @property
+    def custom_threshold_sources(self) -> List[str]:
+        """Origenes de umbral distintos del global que se aplicaron en este lote."""
+        seen = []
+        for signal in self.signals:
+            if signal.thresholds_source != "default" and signal.thresholds_source not in seen:
+                seen.append(signal.thresholds_source)
+        return seen
 
 
 # ---------------------------------------------------------------------------
 # Evaluacion de cada senal
 # ---------------------------------------------------------------------------
 
-def evaluate_schema(violations: List[Any]) -> List[Signal]:
+# Violaciones que no son una cuestion de porcentaje: rompen el contrato aunque el
+# umbral de filas invalidas se afloje, asi que conservan su severidad original.
+#
+#   missing_column      la columna no esta
+#   not_numeric         la columna esta pero no se puede interpretar
+#   row_count_mismatch  features y target tienen distinta cantidad de filas, o sea
+#                       que las predicciones se estan comparando contra el actual
+#                       equivocado. Es el fallo de integridad mas grave de un lote y
+#                       no tiene sentido negociarlo con un porcentaje.
+_STRUCTURAL_VIOLATIONS = ("missing_column", "not_numeric", "row_count_mismatch")
+
+
+def evaluate_schema(violations: List[Any], thresholds=None) -> List[Signal]:
+    """Convierte las violaciones del contrato en senales.
+
+    La severidad se RECALCULA aca con los umbrales del lote. `data_loader` resuelve la
+    suya con los globales porque no sabe a que lote pertenece el archivo que esta
+    leyendo; el monitoreo si lo sabe, y es el que decide el estado del lote.
+    """
+    thresholds = thresholds or config.DEFAULT_THRESHOLDS
     signals = []
     for violation in violations:
         data = violation.to_dict() if hasattr(violation, "to_dict") else dict(violation)
+        pct = float(data.get("pct_rows", 0.0))
+
+        if data.get("kind") in _STRUCTURAL_VIOLATIONS:
+            status = data["severity"]
+        elif pct > thresholds.schema_alert_pct:
+            status = config.STATUS_ALERT
+        elif pct > thresholds.schema_warn_pct:
+            status = config.STATUS_WARNING
+        else:
+            status = config.STATUS_OK
+
         signals.append(Signal(
             name=f"schema:{data['column']}:{data['kind']}",
             category="schema",
-            value=float(data.get("pct_rows", 0.0)),
-            status=data["severity"],
+            value=pct,
+            status=status,
             detail=f"{data['column']}: {data['detail']}",
+            thresholds_source=thresholds.source_for("schema"),
         ))
     if not signals:
         signals.append(Signal(
             name="schema", category="schema", value=0.0,
             status=config.STATUS_OK, detail="contrato de datos respetado",
+            thresholds_source=thresholds.source_for("schema"),
         ))
     return signals
 
 
-def evaluate_feature_drift(features: pd.DataFrame, baseline: Dict[str, Any]):
-    """PSI por feature contra la distribucion de training."""
+def evaluate_feature_drift(features: pd.DataFrame, baseline: Dict[str, Any],
+                           batch_id: str = None):
+    """PSI por feature contra la distribucion de training.
+
+    Es la unica senal que resuelve umbrales POR FEATURE: `bmi` puede merecer una vara
+    mas estricta que `region` sin que eso afecte al resto de las senales del lote.
+    """
     signals, psi_values = [], {}
 
     for column, stats in baseline.get("numeric_features", {}).items():
         if column not in features.columns:
             continue
+        thresholds = config.resolve_thresholds(batch_id=batch_id, feature=column)
         values = pd.to_numeric(features[column], errors="coerce")
         value = psi_numeric(stats.get("bins", {}), values)
         psi_values[column] = value
         observed_mean = float(values.dropna().mean()) if values.notna().any() else float("nan")
         signals.append(Signal(
             name=f"drift:{column}", category="feature_drift",
-            value=value, status=psi_status(value),
+            value=value, status=psi_status(value, thresholds),
             detail=(f"PSI={value:.4f} | media baseline={stats['mean']:.3f} "
                     f"-> batch={observed_mean:.3f}"),
+            thresholds_source=thresholds.source_for("psi"),
         ))
 
     for column, stats in baseline.get("categorical_features", {}).items():
         if column not in features.columns:
             continue
+        thresholds = config.resolve_thresholds(batch_id=batch_id, feature=column)
         value = psi_categorical(stats.get("freqs", {}), features[column])
         psi_values[column] = value
         signals.append(Signal(
             name=f"drift:{column}", category="feature_drift",
-            value=value, status=psi_status(value),
+            value=value, status=psi_status(value, thresholds),
             detail=f"PSI={value:.4f} (categorica)",
+            thresholds_source=thresholds.source_for("psi"),
         ))
 
     return signals, psi_values
 
 
-def evaluate_prediction_drift(predictions, baseline: Dict[str, Any]) -> Signal:
+def evaluate_prediction_drift(predictions, baseline: Dict[str, Any], thresholds=None) -> Signal:
     """Drift de la distribucion de predicciones.
 
     Es la unica senal de comportamiento del modelo disponible cuando el lote no
     trae ground truth.
     """
+    thresholds = thresholds or config.DEFAULT_THRESHOLDS
     reference = baseline.get("predictions", {})
     value = psi_numeric(reference.get("bins", {}), predictions)
     observed_mean = float(np.nanmean(np.asarray(predictions, dtype=float)))
     return Signal(
         name="drift:predictions", category="prediction_drift",
-        value=value, status=psi_status(value),
+        value=value, status=psi_status(value, thresholds),
         detail=(f"PSI={value:.4f} | media baseline=${reference.get('mean', float('nan')):,.2f} "
                 f"-> batch=${observed_mean:,.2f}"),
+        thresholds_source=thresholds.source_for("psi"),
     )
 
 
-def evaluate_performance(metrics: Dict[str, float], baseline_metrics: Dict[str, float]) -> List[Signal]:
+def evaluate_performance(metrics: Dict[str, float], baseline_metrics: Dict[str, float],
+                         thresholds=None) -> List[Signal]:
     """Compara RMSE y R2 del lote contra los de validacion."""
+    thresholds = thresholds or config.DEFAULT_THRESHOLDS
     signals = []
 
     base_rmse = baseline_metrics.get("val_rmse")
     if base_rmse and np.isfinite(base_rmse) and base_rmse > 0:
         ratio = metrics["rmse"] / base_rmse
-        if ratio > config.PERF_ALERT_RATIO:
+        if ratio > thresholds.perf_alert_ratio:
             status = config.STATUS_ALERT
-        elif ratio > config.PERF_WARN_RATIO:
+        elif ratio > thresholds.perf_warn_ratio:
             status = config.STATUS_WARNING
         else:
             status = config.STATUS_OK
@@ -474,15 +537,17 @@ def evaluate_performance(metrics: Dict[str, float], baseline_metrics: Dict[str, 
             name="performance:rmse_ratio", category="performance",
             value=float(ratio), status=status,
             detail=(f"RMSE batch=${metrics['rmse']:,.2f} vs validacion=${base_rmse:,.2f} "
-                    f"(x{ratio:.2f}; umbrales {config.PERF_WARN_RATIO}/{config.PERF_ALERT_RATIO})"),
+                    f"(x{ratio:.2f}; umbrales "
+                    f"{thresholds.perf_warn_ratio}/{thresholds.perf_alert_ratio})"),
+            thresholds_source=thresholds.source_for("perf"),
         ))
 
     base_r2 = baseline_metrics.get("val_r2")
     if base_r2 is not None and np.isfinite(base_r2):
         drop = base_r2 - metrics["r2"]
-        if drop > config.R2_ALERT_DROP:
+        if drop > thresholds.r2_alert_drop:
             status = config.STATUS_ALERT
-        elif drop > config.R2_WARN_DROP:
+        elif drop > thresholds.r2_warn_drop:
             status = config.STATUS_WARNING
         else:
             status = config.STATUS_OK
@@ -491,13 +556,15 @@ def evaluate_performance(metrics: Dict[str, float], baseline_metrics: Dict[str, 
             value=float(drop), status=status,
             detail=(f"R2 batch={metrics['r2']:.4f} vs validacion={base_r2:.4f} "
                     f"(caida={drop:.4f})"),
+            thresholds_source=thresholds.source_for("r2"),
         ))
 
     return signals
 
 
-def evaluate_target_drift(target, baseline: Dict[str, Any]) -> List[Signal]:
+def evaluate_target_drift(target, baseline: Dict[str, Any], thresholds=None) -> List[Signal]:
     """Desvio de la media del target y PSI de su distribucion."""
+    thresholds = thresholds or config.DEFAULT_THRESHOLDS
     reference = baseline.get("target", {})
     base_mean = reference.get("mean")
     values = pd.Series(np.asarray(target, dtype=float)).dropna()
@@ -506,9 +573,9 @@ def evaluate_target_drift(target, baseline: Dict[str, Any]) -> List[Signal]:
     if base_mean and np.isfinite(base_mean) and base_mean != 0 and len(values):
         observed_mean = float(values.mean())
         shift = abs(observed_mean / base_mean - 1.0)
-        if shift > config.TARGET_SHIFT_ALERT:
+        if shift > thresholds.target_shift_alert:
             status = config.STATUS_ALERT
-        elif shift > config.TARGET_SHIFT_WARN:
+        elif shift > thresholds.target_shift_warn:
             status = config.STATUS_WARNING
         else:
             status = config.STATUS_OK
@@ -517,13 +584,15 @@ def evaluate_target_drift(target, baseline: Dict[str, Any]) -> List[Signal]:
             value=float(shift), status=status,
             detail=(f"media baseline=${base_mean:,.2f} -> batch=${observed_mean:,.2f} "
                     f"(ratio x{observed_mean / base_mean:,.2f})"),
+            thresholds_source=thresholds.source_for("target_shift"),
         ))
 
     psi_value = psi_numeric(reference.get("bins", {}), values)
     signals.append(Signal(
         name="target:psi", category="target_drift",
-        value=psi_value, status=psi_status(psi_value),
+        value=psi_value, status=psi_status(psi_value, thresholds),
         detail=f"PSI de la distribucion del target = {psi_value:.4f}",
+        thresholds_source=thresholds.source_for("psi"),
     ))
     return signals
 
@@ -622,12 +691,18 @@ def monitor_batch(
     baseline_metrics = baseline.get("metrics", {})
     predictions = np.asarray(predictions, dtype=float)
 
+    # Umbrales del lote, resueltos una sola vez. El drift de features resuelve ademas
+    # por feature, porque es la unica senal donde tiene sentido afinar columna por
+    # columna (ver config.resolve_thresholds).
+    thresholds = config.resolve_thresholds(batch_id=batch_id)
+
     report = BatchReport(
         batch_id=batch_id,
         n_rows=len(features),
         has_target=target is not None,
         baseline_metrics=baseline_metrics,
         model_info=model_info or {},
+        thresholds=thresholds.to_dict(),
         scored_at=datetime.now().isoformat(timespec="seconds"),
         violations=[
             v.to_dict() if hasattr(v, "to_dict") else dict(v)
@@ -635,13 +710,13 @@ def monitor_batch(
         ],
     )
 
-    report.signals += evaluate_schema(violations or [])
+    report.signals += evaluate_schema(violations or [], thresholds)
 
-    drift_signals, psi_values = evaluate_feature_drift(features, baseline)
+    drift_signals, psi_values = evaluate_feature_drift(features, baseline, batch_id=batch_id)
     report.signals += drift_signals
     report.psi = psi_values
 
-    report.signals.append(evaluate_prediction_drift(predictions, baseline))
+    report.signals.append(evaluate_prediction_drift(predictions, baseline, thresholds))
     report.prediction_summary = {
         "mean": float(np.nanmean(predictions)),
         "std": float(np.nanstd(predictions)),
@@ -651,16 +726,56 @@ def monitor_batch(
 
     if target is not None:
         report.metrics = canonical_metrics(target, predictions, n_features)
-        report.signals += evaluate_performance(report.metrics, baseline_metrics)
-        report.signals += evaluate_target_drift(target, baseline)
+        report.signals += evaluate_performance(report.metrics, baseline_metrics, thresholds)
+        report.signals += evaluate_target_drift(target, baseline, thresholds)
 
     report.status = worst_status(s.status for s in report.signals)
     report.diagnosis = diagnose(report)
     return report
 
 
-def consolidate(reports: List[BatchReport], model_info: Dict[str, Any] = None) -> Dict[str, Any]:
+def _as_transition_dicts(transitions):
+    """Normaliza transiciones de alerta a dicts.
+
+    Se acepta tanto el objeto `alerts.AlertTransition` como su dict para que este
+    modulo no tenga que importar `alerts`: el monitoreo no deberia depender del
+    historial, es al reves.
+
+    `None` se PRESERVA y no se colapsa a `[]`: son cosas distintas. `[]` significa
+    "se reconcilio y no cambio nada"; `None` significa "no se pudo reconciliar", que
+    es el caso de un lote que fallo antes de llegar a esa altura.
+    """
+    if transitions is None:
+        return None
+    return [
+        transition.to_dict() if hasattr(transition, "to_dict") else dict(transition)
+        for transition in transitions
+    ]
+
+
+def _count_transitions(transitions) -> Dict[str, int]:
+    counts = {"new": 0, "ongoing": 0, "resolved": 0}
+    for transition in transitions or []:
+        key = str(transition.get("transition", "")).lower()
+        if key in counts:
+            counts[key] += 1
+    return counts
+
+
+def consolidate(reports: List[BatchReport], model_info: Dict[str, Any] = None,
+                transitions_by_batch: Dict[str, Any] = None) -> Dict[str, Any]:
     """Arma el reporte global a partir de los reportes por lote."""
+    transitions_by_batch = transitions_by_batch or {}
+    por_lote = {
+        batch_id: _as_transition_dicts(transitions)
+        for batch_id, transitions in transitions_by_batch.items()
+    }
+
+    total = {"new": 0, "ongoing": 0, "resolved": 0}
+    for transitions in por_lote.values():
+        for key, value in _count_transitions(transitions).items():
+            total[key] += value
+
     return _jsonable({
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "model_info": model_info or {},
@@ -670,14 +785,22 @@ def consolidate(reports: List[BatchReport], model_info: Dict[str, Any] = None) -
             status: sum(1 for r in reports if r.status == status)
             for status in config.STATUS_ORDER
         },
+        # El semaforo dice COMO esta cada lote; esto dice QUE CAMBIO desde la corrida
+        # anterior, que es lo unico que amerita que alguien mire el reporte.
+        "alerts": {"summary": total, "by_batch": por_lote},
         "batches": [r.to_dict() for r in reports],
     })
 
 
-def to_dataframe(reports: List[BatchReport]) -> pd.DataFrame:
+def to_dataframe(reports: List[BatchReport],
+                 transitions_by_batch: Dict[str, Any] = None) -> pd.DataFrame:
     """Vista tabular del reporte, para CSV y para persistir en la base."""
+    transitions_by_batch = transitions_by_batch or {}
     rows = []
     for report in reports:
+        counts = _count_transitions(
+            _as_transition_dicts(transitions_by_batch.get(report.batch_id))
+        )
         rows.append({
             "batch_id": report.batch_id,
             "scored_at": report.scored_at,
@@ -694,6 +817,9 @@ def to_dataframe(reports: List[BatchReport]) -> pd.DataFrame:
             "psi_max_feature": report.psi_max_feature,
             "n_violations": len(report.violations),
             "pred_mean": report.prediction_summary.get("mean"),
+            "alerts_new": counts["new"],
+            "alerts_ongoing": counts["ongoing"],
+            "alerts_resolved": counts["resolved"],
             "diagnosis": report.diagnosis,
             "model_name": report.model_info.get("model_name"),
             "model_version": report.model_info.get("model_version"),
@@ -708,7 +834,40 @@ def to_dataframe(reports: List[BatchReport]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 _ICON = {config.STATUS_OK: "[ OK ]", config.STATUS_WARNING: "[WARN]", config.STATUS_ALERT: "[ALRT]"}
+_TRANSITION_ICON = {"NEW": "[NUEVA]   ", "ONGOING": "[PERSISTE]", "RESOLVED": "[RESUELTA]"}
+_TRANSITION_ORDER = {"NEW": 0, "ONGOING": 1, "RESOLVED": 2}
 _WIDTH = 78
+
+
+def _render_batch_alerts(transitions, indent: str = "  ") -> List[str]:
+    """Bloque de alertas de un lote: lo nuevo separado de lo que ya se sabia."""
+    if transitions is None:
+        return [f"{indent}el lote no se pudo procesar: no hubo reconciliacion de alertas",
+                f"{indent}(las alertas previas de este lote siguen abiertas)"]
+    if not transitions:
+        return [f"{indent}sin cambios en el historial de alertas"]
+
+    lines = []
+    for transition in sorted(transitions,
+                             key=lambda x: (_TRANSITION_ORDER.get(x.get("transition"), 9),
+                                            x.get("signal_name", ""))):
+        kind = transition.get("transition", "")
+        icon = _TRANSITION_ICON.get(kind, "[?]       ")
+        occurrences = transition.get("occurrences", 1)
+        if kind == "NEW":
+            contexto = "1a vez"
+        elif kind == "ONGOING":
+            contexto = f"{occurrences} corridas, desde {transition.get('first_seen', 'n/d')}"
+            previa, actual = transition.get("escalated_from"), transition.get("severity")
+            if previa and actual and previa != actual:
+                subio = (config.STATUS_ORDER.index(actual) > config.STATUS_ORDER.index(previa)
+                         if actual in config.STATUS_ORDER and previa in config.STATUS_ORDER
+                         else True)
+                contexto += f"; {'ESCALADA' if subio else 'BAJO'} {previa} -> {actual}"
+        else:
+            contexto = f"estuvo {occurrences} corrida(s) abierta"
+        lines.append(f"{indent}{icon} {transition.get('signal_name', ''):<28} ({contexto})")
+    return lines
 
 
 def render_text_report(consolidated: Dict[str, Any]) -> str:
@@ -733,6 +892,19 @@ def render_text_report(consolidated: Dict[str, Any]) -> str:
         f"Lotes:           {consolidated['n_batches']}",
         f"Estado global:   {_ICON[consolidated['overall_status']]} {consolidated['overall_status']}",
         f"Desglose:        OK={counts.get('OK', 0)}  WARNING={counts.get('WARNING', 0)}  ALERT={counts.get('ALERT', 0)}",
+    ]
+
+    alerts_block = consolidated.get("alerts") or {}
+    resumen = alerts_block.get("summary") or {}
+    if resumen:
+        lines.append(
+            f"Alertas:         NUEVAS={resumen.get('new', 0)}  "
+            f"PERSISTEN={resumen.get('ongoing', 0)}  RESUELTAS={resumen.get('resolved', 0)}"
+        )
+        if resumen.get("new"):
+            lines.append("                 ^ lo unico que no se sabia en la corrida anterior")
+
+    lines += [
         "",
         "-" * _WIDTH,
         "RESUMEN POR LOTE",
@@ -776,38 +948,103 @@ def render_text_report(consolidated: Dict[str, Any]) -> str:
                       f"  media=${predictions['mean']:,.2f}  std=${predictions['std']:,.2f}  "
                       f"min=${predictions['min']:,.2f}  max=${predictions['max']:,.2f}"]
 
+        # El estado de cada senal se LEE del reporte y no se recalcula: recalcularlo
+        # con los umbrales globales contradiria al listado de senales de mas abajo
+        # cada vez que una regla por feature o por lote este en juego.
+        signals = batch.get("signals", [])
+        status_by_name = {s["name"]: s for s in signals}
+
         if batch.get("psi"):
             lines += ["", "Drift de features (PSI):"]
             for feature, value in sorted(batch["psi"].items(), key=lambda kv: -kv[1]):
-                lines.append(f"  {_ICON[psi_status(value)]} {feature:<12} PSI={value:.4f}")
+                signal = status_by_name.get(f"drift:{feature}", {})
+                status = signal.get("status", psi_status(value))
+                origin = signal.get("thresholds_source", "default")
+                marca = "" if origin == "default" else f"  (regla {origin})"
+                lines.append(f"  {_ICON[status]} {feature:<12} PSI={value:.4f}{marca}")
 
         violations = batch.get("violations") or []
         if violations:
             lines += ["", "Violaciones del contrato de datos:"]
             for violation in violations:
+                signal = status_by_name.get(f"schema:{violation['column']}:{violation['kind']}", {})
+                status = signal.get("status", violation["severity"])
                 lines.append(
-                    f"  {_ICON[violation['severity']]} {violation['column']}: {violation['detail']} "
+                    f"  {_ICON[status]} {violation['column']}: {violation['detail']} "
                     f"({violation['n_rows']} filas, {violation['pct_rows']:.1f}%)"
                 )
 
-        non_ok = [s for s in batch.get("signals", []) if s["status"] != config.STATUS_OK]
+        non_ok = [s for s in signals if s["status"] != config.STATUS_OK]
         if non_ok:
             lines += ["", "Senales que no estan en OK:"]
             for signal in non_ok:
-                lines.append(f"  {_ICON[signal['status']]} {signal['name']}: {signal['detail']}")
+                origin = signal.get("thresholds_source", "default")
+                marca = "" if origin == "default" else f"  [regla {origin}]"
+                lines.append(f"  {_ICON[signal['status']]} {signal['name']}: {signal['detail']}{marca}")
+
+        custom = sorted({s.get("thresholds_source", "default") for s in signals} - {"default"})
+        if custom:
+            lines += ["", f"Reglas de umbral aplicadas: {', '.join(custom)}"]
+
+        # Se distingue la clave AUSENTE (no hay informacion de alertas en este
+        # reporte) de la clave presente con valor None (el lote existe pero no se
+        # pudo reconciliar). Son estados distintos y decir lo mismo de los dos
+        # ocultaria justo el caso que hay que mirar.
+        by_batch = alerts_block.get("by_batch") or {}
+        if batch["batch_id"] in by_batch:
+            lines += ["", "Alertas:"] + _render_batch_alerts(by_batch[batch["batch_id"]])
 
         lines += ["", "Diagnostico:"]
         lines += ["  " + chunk for chunk in _wrap(batch["diagnosis"], _WIDTH - 2)]
 
-    lines += ["", "=" * _WIDTH,
-              "Umbrales aplicados:",
-              f"  PSI:             WARNING > {config.PSI_WARN}   ALERT > {config.PSI_ALERT}",
-              f"  RMSE ratio:      WARNING > {config.PERF_WARN_RATIO}x   ALERT > {config.PERF_ALERT_RATIO}x",
-              f"  Caida de R2:     WARNING > {config.R2_WARN_DROP}   ALERT > {config.R2_ALERT_DROP}",
-              f"  Desvio target:   WARNING > {config.TARGET_SHIFT_WARN:.0%}   ALERT > {config.TARGET_SHIFT_ALERT:.0%}",
-              f"  Filas invalidas: WARNING > {config.SCHEMA_WARN_PCT}%   ALERT > {config.SCHEMA_ALERT_PCT}%",
-              "=" * _WIDTH]
+    lines += ["", "=" * _WIDTH] + _render_thresholds_footer(consolidated) + ["=" * _WIDTH]
     return "\n".join(lines)
+
+
+def _render_thresholds_footer(consolidated: Dict[str, Any]) -> List[str]:
+    """Pie con los umbrales EFECTIVOS, no con los globales.
+
+    Si algun lote se midio con una regla propia, imprimir solo los globales seria
+    enganoso: el lector deduciria del reporte umbrales que a ese lote no se le
+    aplicaron.
+    """
+    default = config.DEFAULT_THRESHOLDS
+
+    def bloque(thresholds, titulo):
+        return [
+            titulo,
+            f"  PSI:             WARNING > {thresholds.psi_warn}   ALERT > {thresholds.psi_alert}",
+            f"  RMSE ratio:      WARNING > {thresholds.perf_warn_ratio}x   "
+            f"ALERT > {thresholds.perf_alert_ratio}x",
+            f"  Caida de R2:     WARNING > {thresholds.r2_warn_drop}   "
+            f"ALERT > {thresholds.r2_alert_drop}",
+            f"  Desvio target:   WARNING > {thresholds.target_shift_warn:.0%}   "
+            f"ALERT > {thresholds.target_shift_alert:.0%}",
+            f"  Filas invalidas: WARNING > {thresholds.schema_warn_pct}%   "
+            f"ALERT > {thresholds.schema_alert_pct}%",
+        ]
+
+    lines = bloque(default, "Umbrales por defecto:")
+
+    excepciones = []
+    for batch in consolidated.get("batches", []):
+        for signal in batch.get("signals", []):
+            origin = signal.get("thresholds_source", "default")
+            if origin != "default":
+                excepciones.append((batch["batch_id"], origin, signal["name"]))
+
+    if excepciones:
+        lines += ["", "Excepciones aplicadas (ver config/monitoring_rules.json):"]
+        vistos = set()
+        for batch_id, origin, signal_name in excepciones:
+            clave = (batch_id, origin)
+            if clave in vistos:
+                continue
+            vistos.add(clave)
+            afectadas = sorted({s for b, o, s in excepciones if (b, o) == clave})
+            lines.append(f"  {batch_id:<8} regla '{origin}' -> {', '.join(afectadas)}")
+
+    return lines
 
 
 def _wrap(text: str, width: int) -> List[str]:

@@ -1,8 +1,8 @@
 # ============================================================================
 # MetLife ML Ops Challenge - Dependencias
 # ----------------------------------------------------------------------------
-# Se usan rangos en vez de pines exactos porque el proyecto debe correr tanto
-# en Python 3.10 (Docker) como en 3.11 (entorno local de desarrollo).
+# Se usan rangos en vez de pines exactos para tolerar Python 3.10 y 3.11: el
+# proyecto original apuntaba a 3.10 y la solucion se desarrollo sobre 3.11.
 # ============================================================================
 
 # --- Core data / ML ---------------------------------------------------------
