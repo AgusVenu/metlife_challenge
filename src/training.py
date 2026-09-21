@@ -753,7 +753,7 @@ def log_candidate_run(candidate: Candidate, timestamp: str, cv_path: Path = None
         tengan artefacto de modelo hace que sea IMPOSIBLE resolver a uno de ellos por
         accidente, incluso si alguien afloja ese filtro mas adelante.
       - Sin metricas sin prefijo: `rmse`, `mae`, `r2` y `mape` son la serie que cruza
-        etapas (validacion -> prod1 -> prod2, ver DECISIONS.md 2.12 y 2.13). Si cuatro
+        etapas (validacion -> prod1 -> prod2, ver INFORME.md, seccion 4). Si cuatro
         candidatos las escriben, ese grafico deja de significar lo que documenta.
 
     Lo que si queda es todo lo necesario para reproducir la familia desde la semilla:

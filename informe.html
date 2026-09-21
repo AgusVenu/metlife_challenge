@@ -1043,8 +1043,8 @@ Alertas: <b>8 nuevas</b> | 0 persisten        Alertas: 0 nuevas | <b>8 persisten
         <p>
           Los siete restantes —MAPE duplicado bajo otro nombre, trabajo muerto, un log que
           decía «Symlink» donde el código hacía <code>copy2</code>, negaciones faltantes y tres
-          sobre el <code>docker-compose.yaml</code>— están en <code>DECISIONS.md § 3</code> con
-          su estado.
+          sobre el <code>docker-compose.yaml</code>— están corregidos o, en el caso de los
+          de Docker, quedaron sin efecto al eliminarse esos archivos.
         </p>
       </section>
 
@@ -1136,7 +1136,7 @@ Alertas: <b>8 nuevas</b> | 0 persisten        Alertas: 0 nuevas | <b>8 persisten
               </tr>
               <tr>
                 <td class="num">6</td><td>La documentación permite reproducir el flujo completo</td>
-                <td><code>SOLUTION.md</code> y la sección siguiente</td><td class="num tick">✓</td>
+                <td>La sección siguiente, verificada corriendo la secuencia desde cero</td><td class="num tick">✓</td>
               </tr>
             </tbody>
           </table>
@@ -1226,11 +1226,12 @@ params.eval_dataset = 'prod1'                                 <span class="c"># 
       <footer>
         <p>
           <strong>Documentos relacionados.</strong>
-          <code>SOLUTION.md</code> — guía operativa, cómo instalar, ejecutar y leer cada
-          salida. <code>DECISIONS.md</code> — análisis forense completo, las decisiones de
-          arquitectura con su fundamento, los once bugs y los supuestos asumidos.
+          <code>INFORME.md</code> — este mismo informe en Markdown, dentro del repositorio.
           <code>README.md</code> — documento original del equipo de ciencia de datos,
-          preservado sin modificar.
+          preservado sin modificar: sigue siendo la referencia del modelo, del feature
+          engineering y del EDA. <code>challenge_ml.md</code> — el enunciado.
+          Este informe es el único documento de la solución; las guías separadas se
+          consolidaron acá y quedan en el historial de git.
         </p>
         <p>
           Informe generado a partir de la corrida de referencia del pipeline. Las cifras

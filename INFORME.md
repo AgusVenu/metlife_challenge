@@ -6,7 +6,7 @@
 |---|---|
 | **Repositorio** | `metlife-challenge-mlops` |
 | **Stack** | Python 3.11 · MLflow 3.16 · PostgreSQL 17 · scikit-learn 1.9 · XGBoost 3.2 |
-| **Entregables** | `INFORME.md` (este documento) · `informe.html` (versión navegable) · `SOLUTION.md` (guía de ejecución) · `DECISIONS.md` (decisiones y hallazgos) |
+| **Entregables** | `INFORME.md` (este documento) · `informe.html` (misma versión, navegable) |
 | **Estado** | Pipeline completo verificado end-to-end en local · 172 tests |
 
 ---
@@ -50,8 +50,9 @@ dashboards y tests unitarios. **Los cuatro están implementados.**
 
 > El enunciado cierra con una instrucción que gobierna buena parte de este informe:
 > *"Si detectás ambigüedades, asumí una decisión razonable y documentala explícitamente
-> en la solución."* Las decisiones no obvias están justificadas acá y en `DECISIONS.md`;
-> donde la solución se desvía del enunciado, la desviación se declara (§ 10).
+> en la solución."* Este documento es esa documentación: cada decisión no obvia está
+> justificada donde aparece, y donde la solución se desvía del enunciado la desviación
+> se declara (§ 10).
 
 ---
 
@@ -582,12 +583,12 @@ Once hallazgos. Los cuatro con impacto real:
 
 Los siete restantes —MAPE duplicado bajo otro nombre, trabajo muerto en el "Paso 5 beta",
 un log que decía "Symlink" donde el código hacía `copy2`, negaciones faltantes en
-`.gitignore`, y tres sobre el `docker-compose.yaml`— están en `DECISIONS.md § 3` con su
-estado.
+`.gitignore`, y tres sobre el `docker-compose.yaml`— están corregidos o, en el caso de
+los de Docker, quedaron sin efecto al eliminarse esos archivos (§ 10.1).
 
 El bug del README (`cp .env.example .env`, archivo que nunca existió) **no se corrigió
 ahí**: el README original se preserva intacto por decisión de proyecto. La instrucción
-correcta está en `SOLUTION.md`.
+correcta es `cp .env.template .env`, como indica § 12.
 
 ---
 
@@ -618,8 +619,9 @@ Toda la configuración se lee de variables de entorno, así que containerizarlo 
 directo para quien tenga con qué probarlo.
 
 > **Nota.** El `README.md` original sigue presentando Docker como la forma principal de
-> correr el proyecto. Se preserva intacto por decisión de proyecto (`DECISIONS.md § 6`),
-> pero conviene saberlo: la guía vigente es `SOLUTION.md`.
+> correr el proyecto. Se preserva intacto a propósito —es el documento del equipo de
+> ciencia de datos y sigue siendo la referencia del modelo y del EDA— pero conviene
+> saberlo: la guía de ejecución vigente es § 12 de este informe.
 
 ### 10.2 Lo que no se hizo, a propósito
 
@@ -645,7 +647,7 @@ directo para quien tenga con qué probarlo.
 | 3 | Scoring usa el mejor artefacto entrenado, no un modelo aislado | ✅ | `resolve_model()` con cadena explícita y logueada; el origen viaja hasta `batch_predictions` |
 | 4 | Se generan predicciones sobre los lotes de `data/prod/` | ✅ | 3 lotes × 1.338 filas; CSV por lote + tabla `batch_predictions` |
 | 5 | Existe un reporte de monitoreo por batch con métricas y estado | ✅ | JSON + CSV + TXT + dashboard HTML, con semáforo y diagnóstico |
-| 6 | La documentación permite reproducir el flujo completo | ✅ | `SOLUTION.md` § "Instalación y ejecución"; § 12 de este informe |
+| 6 | La documentación permite reproducir el flujo completo | ✅ | § 12 de este informe, verificado corriendo la secuencia desde cero |
 
 **Bonus del enunciado:**
 
@@ -768,7 +770,11 @@ scripts/mlflow_ui.sh      Levanta la UI sin exponer la contraseña
 
 | Documento | Qué contiene |
 |---|---|
-| **`SOLUTION.md`** | Guía operativa: cómo instalar, ejecutar y leer cada salida |
-| **`DECISIONS.md`** | Análisis forense completo, las 16 decisiones de arquitectura con su fundamento, los 11 bugs y los supuestos asumidos |
-| **`README.md`** | Documento original del equipo de ciencia de datos, preservado sin modificar |
+| **`informe.html`** | Este mismo informe, navegable, con índice lateral y soporte de tema |
+| **`README.md`** | Documento original del equipo de ciencia de datos, preservado sin modificar. Es la referencia del modelo, del feature engineering y del EDA |
 | **`challenge_ml.md`** | Enunciado del challenge |
+
+> Este informe es el **único documento de la solución**. Las guías separadas
+> (`SOLUTION.md`, `DECISIONS.md`) se consolidaron acá: tres documentos que decían
+> parcialmente lo mismo ya se habían desincronizado dos veces, y un entregable que se
+> contradice a sí mismo es peor que uno más escueto. Quedan en el historial de git.

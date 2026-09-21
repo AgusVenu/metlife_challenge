@@ -4,7 +4,7 @@ No se usa PostgreSQL: se sustituye el engine por un doble que registra las sente
 ejecutadas. Lo que se verifica aca es la REGLA de decision -- que senal produce que
 transicion, y que una alerta que ya estaba abierta se ACTUALICE en vez de volver a
 insertarse. Que el SQL corra de verdad contra Postgres se verifica ejecutando el
-pipeline (ver SOLUTION.md), no en esta suite.
+pipeline (ver INFORME.md, seccion 12), no en esta suite.
 """
 
 from contextlib import contextmanager
