@@ -32,7 +32,6 @@ facturado es de **$13.270** por póliza.
 | **2** | 🔴 Alerta | Los importes venían **multiplicados por 100** — como si el archivo estuviera en centavos |
 | **3** | 🔴 Alerta | Un dato clínico (índice de masa corporal) venía **sin la coma decimal**, y el lote **no traía resultados reales** contra los cuales compararse |
 
-Lo importante no es que los detectara. Es que **los distinguió**.
 
 ### Lote 2: el problema estaba en el dato, no en el modelo
 
@@ -203,13 +202,3 @@ El modelo mejoró poco. Lo que cambió es que **dos de cada tres lotes de produc
 traían defectos que antes habrían pasado inadvertidos** —uno de ellos equivalente a
 $3,4 millones de exposición mal tarifada— y ahora no sólo se detectan, sino que el
 sistema explica cuál es el problema en cada caso.
-
----
-
-## Dónde está el detalle
-
-| Documento | Para quién |
-|---|---|
-| **`informe.html`** | El informe técnico completo: arquitectura, decisiones de diseño, verificación contra los criterios de aceptación e instrucciones de ejecución |
-| **`README.md`** | Documento original del equipo de ciencia de datos, preservado sin modificar: la referencia sobre el modelo y el análisis exploratorio |
-| **`challenge_ml.md`** | El enunciado del challenge |
