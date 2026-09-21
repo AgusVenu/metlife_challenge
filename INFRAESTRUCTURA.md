@@ -1,14 +1,5 @@
 # Infraestructura — qué sería containerizar esto
 
-> **Nada de acá se ejecutó.** Es el análisis de una opción, no una entrega. La razón por
-> la que el proyecto no se entrega containerizado es precisamente que no había forma de
-> probarlo, y entregar infra sin correrla es afirmar algo que no se verificó.
-
-**Hoy funciona así:** entorno virtual de Python 3.11 + PostgreSQL instalado en la
-máquina. Verificado de punta a punta.
-
----
-
 ## 1. Cómo se repartiría el trabajo
 
 Serían **tres contenedores**, y la división no es arbitraria: separa lo que tiene estado

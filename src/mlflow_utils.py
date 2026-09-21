@@ -7,7 +7,7 @@ Production)". MLflow deprecó los stages en 2.9 y los elimino de la API en 3.x;
 el reemplazo son los ALIASES, que son punteros con nombre a una version
 concreta. Se usan aliases `staging` y `production` y ademas se escribe un tag
 `stage` con el nombre clasico, para que la equivalencia con el enunciado quede
-explicita tanto en la UI como en la base del registry. Ver INFORME.md, seccion 6.
+explicita tanto en la UI como en la base del registry.
 """
 
 import json

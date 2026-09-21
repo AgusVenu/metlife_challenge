@@ -65,7 +65,7 @@ def env_int(key: str, default: int, *, fallback_key: str = None) -> int:
     """Lee un entero del entorno.
 
     `fallback_key` existe para tolerar el typo historico HIPERPARAM_ITERATIONS
-    (ver INFORME.md, seccion 9): el entorno del proyecto original exportaba
+    del codigo original: el entorno del proyecto exportaba
     HYPERPARAM_ITERATIONS pero el codigo leia HIPERPARAM_ITERATIONS, asi que la
     variable nunca tenia efecto. Se acepta la correcta primero y la vieja como
     respaldo.
@@ -237,7 +237,7 @@ BASELINE_ARTIFACT = "baseline_stats.json"
 
 # MLflow >= 2.9 deprecó los stages (Staging/Production) en favor de aliases.
 # Se usan aliases y se mantiene un tag `stage` con el nombre clasico, para que
-# el mapeo con el enunciado del challenge sea explicito. Ver INFORME.md, seccion 6.
+# el mapeo con el enunciado del challenge (que pide Staging/Production) sea explicito.
 ALIAS_PRODUCTION = "production"
 ALIAS_STAGING = "staging"
 
