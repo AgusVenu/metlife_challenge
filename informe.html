@@ -258,6 +258,10 @@ footer p { margin:0 0 8px; }
       MLflow, scoring batch sobre datos reales de producción y un sistema de alertas que
       recuerda lo que ya avisó.
     </p>
+    <p class="standfirst" style="font-size:15px;color:var(--ink-3);max-width:44em;">
+      Éste es el informe técnico. Para la lectura de negocio —qué se encontró, qué riesgo
+      evita y qué falta— está <code>INFORME.md</code>, en dos páginas.
+    </p>
     <dl class="factbar">
       <div class="fact"><dt>Stack</dt><dd>Python 3.11 · MLflow 3.16 · PostgreSQL 17</dd></div>
       <div class="fact"><dt>Modelos comparados</dt><dd><b>4</b> familias + línea de base</dd></div>
@@ -1226,12 +1230,12 @@ params.eval_dataset = 'prod1'                                 <span class="c"># 
       <footer>
         <p>
           <strong>Documentos relacionados.</strong>
-          <code>INFORME.md</code> — este mismo informe en Markdown, dentro del repositorio.
+          <code>INFORME.md</code> — el mismo trabajo contado para decisión de negocio, en
+          dos páginas: qué se encontró en los datos de producción, qué riesgo evita y qué
+          falta para operar. Empezar por ahí si no se busca el detalle técnico.
           <code>README.md</code> — documento original del equipo de ciencia de datos,
           preservado sin modificar: sigue siendo la referencia del modelo, del feature
           engineering y del EDA. <code>challenge_ml.md</code> — el enunciado.
-          Este informe es el único documento de la solución; las guías separadas se
-          consolidaron acá y quedan en el historial de git.
         </p>
         <p>
           Informe generado a partir de la corrida de referencia del pipeline. Las cifras
